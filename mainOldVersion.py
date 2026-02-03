@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import onnx
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -16,21 +17,82 @@ from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
 from models import build_model
 
-import safe_gpu
-while True:
-    try:
-        safe_gpu.claim_gpus()
-        break
-    except:
-        print("Waiting for free GPU")
-        time.sleep(5)
-        pass
+class OnnxExporter:
+    """Utility for exporting PyTorch models to ONNX format."""
+    
+    def __init__(self, input_shape=(3, 256, 256), opset_version=15, 
+                 input_names=None, output_names=None, dynamic_axes=None):
+        """
+        Args:
+            input_shape: Model input shape as (C, H, W)
+            opset_version: ONNX opset version to use
+            input_names: List of input tensor names
+            output_names: List of output tensor names
+            dynamic_axes: Dictionary defining dynamic axes (e.g., batch dimension)
+        """
+        self.input_shape = input_shape
+        self.opset_version = opset_version
+        self.input_names = input_names or ["input"]
+        self.output_names = output_names or ["output"]
+        self.dynamic_axes = dynamic_axes or {"input": {0: "batch_size"}}
+    
+    def export(self, model, output_path, batch_size=1, device='cpu', verbose=False):
+        """
+        Export a PyTorch model to ONNX format.
+        
+        Args:
+            model: PyTorch model to export
+            output_path: Path where the ONNX model will be saved
+            batch_size: Batch size for the dummy input
+            device: Device to run the export on ('cuda' or 'cpu')
+            verbose: Whether to print verbose ONNX export logs
+        
+        Returns:
+            onnx.ModelProto: Loaded ONNX model
+        """
+        model.eval()
+        model.to(device=device)
+        
+        # Create dummy input
+        if len(self.input_shape) == 3:
+            dummy_input = torch.randn(
+                batch_size, 
+                self.input_shape[0], 
+                self.input_shape[1], 
+                self.input_shape[2]
+            ).to(device=device)
+        else:
+            dummy_input = torch.randn(
+                batch_size, 
+                self.input_shape[0], 
+                self.input_shape[1], 
+            ).to(device=device)
+        
+        # Export to ONNX
+        torch.onnx.export(
+            model,
+            dummy_input,
+            output_path,
+            input_names=self.input_names,
+            output_names=self.output_names,
+            opset_version=self.opset_version,
+            dynamic_axes=self.dynamic_axes,
+            verbose=verbose,
+        )
+        
+        # Validate the exported model
+        onnx_model = onnx.load(output_path)
+        onnx.checker.check_model(onnx_model)
+        print(f"✅ Exported ONNX model to {output_path}")
+        
+        return onnx_model
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=6, type=int)
+    parser.add_argument('--batch_size', default=8, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--lr_drop', default=200, type=int)
@@ -123,6 +185,44 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     return parser
 
+def register_hooks(model):
+    hooks = []
+
+    def hook(module, inp, out):
+        cls = module.__class__.__name__
+
+        in_shapes = [
+            tuple(x.shape) for x in inp if torch.is_tensor(x)
+        ]
+
+        if torch.is_tensor(out):
+            out_shape = tuple(out.shape)
+        elif isinstance(out, (list, tuple)):
+            out_shape = [tuple(x.shape) for x in out if torch.is_tensor(x)]
+        else:
+            out_shape = type(out)
+
+        param_shapes = {
+            name: tuple(p.shape)
+            for name, p in module.named_parameters(recurse=False)
+        }
+
+        buffer_shapes = {
+            name: tuple(b.shape)
+            for name, b in module.named_buffers(recurse=False)
+        }
+
+        print(f"{cls}")
+        print(f"  input:  {in_shapes}")
+        print(f"  output: {out_shape}")
+        if param_shapes:
+            print(f"  params: {param_shapes}")
+        if buffer_shapes:
+            print(f"  buffers:{buffer_shapes}")
+
+    for m in model.modules():
+        if len(list(m.children())) == 0:  # leaf modules only
+            hooks.append(m.register_forward_hook(hook))
 
 def main(args):
     utils.init_distributed_mode(args)
@@ -140,24 +240,44 @@ def main(args):
 
     model, criterion, postprocessors = build_model(args)
     model.to(device)
+    dummy_input = torch.randn(1, 3, 640, 640).to(device)
+    out = model(dummy_input)
 
-    model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
+        model = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
     param_dicts = [
-        {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and p.requires_grad]},
+        {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
         {
-            "params": [p for n, p in model_without_ddp.named_parameters() if "backbone" in n and p.requires_grad],
+            "params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
             "lr": args.lr_backbone,
         },
     ]
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+    
+    # Create warmup + step decay scheduler
+    # Warmup: linearly increase LR from warmup_start_lr to lr over warmup_epochs
+    # Then: step decay at lr_drop epoch
+    if args.warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, 
+            start_factor=args.warmup_start_lr / args.lr,
+            end_factor=1.0,
+            total_iters=args.warmup_epochs
+        )
+        step_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, step_scheduler],
+            milestones=[args.warmup_epochs]
+        )
+    else:
+        # No warmup, use only step decay scheduler
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
@@ -184,6 +304,15 @@ def main(args):
     else:
         base_ds = get_coco_api_from_dataset(dataset_val)
 
+    if args.pretrained_path is not None:
+        print(f"Loading pretrained model from {args.pretrained_path}")
+        checkpoint = torch.load(args.pretrained_path, map_location='cpu')
+        if 'model' in checkpoint:
+            model.load_state_dict(checkpoint['model'], strict=False)
+        else:
+            model.load_state_dict(checkpoint, strict=False)
+        print("✓ Pretrained model loaded successfully")
+
     output_dir = Path(args.output_dir)
     if args.resume:
         if args.resume.startswith('https'):
@@ -191,7 +320,7 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        model.load_state_dict(checkpoint['model'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -220,7 +349,7 @@ def main(args):
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
+                    'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,

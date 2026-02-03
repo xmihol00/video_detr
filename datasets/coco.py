@@ -19,6 +19,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask(return_masks)
+        self.root = Path(str(Path(self.root)).replace("coco/train2017", "coco/images/train2017/").replace("coco/val2017", "coco/images/val2017/"))
 
     def __getitem__(self, idx):
         img, target = super(CocoDetection, self).__getitem__(idx)
