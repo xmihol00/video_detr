@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -N detr_train
-#PBS -l select=1:ncpus=8:ngpus=1:mem_free=24G:gpu_ram=24G
+#PBS -l select=1:ncpus=8:ngpus=2:mem_free=24G:gpu_ram=24G
 #PBS -l walltime=24:00:00
 #PBS -j oe
 #PBS -o train.log
@@ -10,4 +10,4 @@ source setup.sh
 conda activate orig_yolo
 cd "/mnt/matylda5/xmihol00/video_detr"
 
-python main.py > train_output.log 2>&1
+python main.py 

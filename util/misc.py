@@ -179,9 +179,10 @@ class MetricLogger(object):
     def __str__(self):
         loss_str = []
         for name, meter in self.meters.items():
-            loss_str.append(
-                "{}: {}".format(name, str(meter))
-            )
+            if name in ["lr", "class_error", "loss", "loss_ce", "loss_bbox"]:
+                loss_str.append(
+                    "{}: {}".format(name, str(meter))
+                )
         return self.delimiter.join(loss_str)
 
     def synchronize_between_processes(self):

@@ -19,7 +19,7 @@ from models import build_model
 import safe_gpu
 while True:
     try:
-        safe_gpu.claim_gpus()
+        safe_gpu.claim_gpus(2)
         break
     except:
         print("Waiting for free GPU")
@@ -30,11 +30,11 @@ def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=6, type=int)
+    parser.add_argument('--batch_size', default=5, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=300, type=int)
+    parser.add_argument('--epochs', default=4, type=int)
     parser.add_argument('--lr_drop', default=200, type=int)
-    parser.add_argument('--warmup_epochs', default=0, type=int,
+    parser.add_argument('--warmup_epochs', default=3, type=int,
                         help='number of warmup epochs')
     parser.add_argument('--warmup_start_lr', default=1e-6, type=float,
                         help='initial learning rate for warmup')
@@ -42,7 +42,7 @@ def get_args_parser():
                         help='gradient clipping max norm')
 
     # Model parameters
-    parser.add_argument('--pretrained_path', type=str, default=None,
+    parser.add_argument('--pretrained_path', type=str, default="detr-r50-e632da11.pth",
                         help="Path to the pretrained model checkpoint. If set, loads full model weights for training. Overrides --pretrained_backbone.")
     # * Backbone
     parser.add_argument('--backbone', default='resnet50', type=str,
@@ -93,7 +93,7 @@ def get_args_parser():
     parser.add_argument('--dice_loss_coef', default=1, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
-    parser.add_argument('--eos_coef', default=0.02, type=float,
+    parser.add_argument('--eos_coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
 
     # dataset parameters
@@ -115,12 +115,13 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--num_workers', default=8, type=int)
 
     # distributed training parameters
-    parser.add_argument('--world_size', default=1, type=int,
+    parser.add_argument('--world_size', default=2, type=int,
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+
     return parser
 
 
@@ -260,5 +261,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
     if args.output_dir:
+        # if the output directory exists and it ends with a number, increment that number or attach a number if it doesn't
+        # end with a number
+        if Path(args.output_dir).exists():
+            suffix = args.output_dir.split('_')[-1]
+            if suffix.isdigit():
+                new_suffix = int(suffix) + 1
+                args.output_dir = '_'.join(args.output_dir.split('_')[:-1]) + f'_{new_suffix}'
+            else:
+                args.output_dir = args.output_dir + '_1'
+
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
