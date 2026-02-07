@@ -30,6 +30,8 @@ _parentDir = Path(__file__).resolve().parent.parent.parent
 if str(_parentDir) not in sys.path:
     sys.path.insert(0, str(_parentDir))
 
+import hashlib
+import json
 import os
 import random
 import re
@@ -41,6 +43,9 @@ from PIL import Image
 import yaml
 
 from datasets import transforms as T
+
+# Cache version - increment when cache format changes
+CACHE_VERSION = "1.0"
 
 
 class VideoSequenceDataset(Dataset):
@@ -60,6 +65,7 @@ class VideoSequenceDataset(Dataset):
         minFrameGap: Minimum gap between sampled frames (default: 1)
         maxFrameGap: Maximum gap between sampled frames (default: 10)
         classNames: Optional list of class names
+        useCache: Whether to use cached sequence information (default: True)
     """
     
     # Regex pattern for parsing filenames: seq_XXXXXX_frame_XXXX
@@ -74,7 +80,8 @@ class VideoSequenceDataset(Dataset):
         framesPerSequence: int = 50,
         minFrameGap: int = 1,
         maxFrameGap: int = 10,
-        classNames: Optional[List[str]] = None
+        classNames: Optional[List[str]] = None,
+        useCache: bool = True
     ):
         super().__init__()
         
@@ -86,6 +93,7 @@ class VideoSequenceDataset(Dataset):
         self.minFrameGap = minFrameGap
         self.maxFrameGap = maxFrameGap
         self.classNames = classNames
+        self.useCache = useCache
         
         # Paths to images and labels directories
         self.imagesDir = self.dataRoot / 'images'
@@ -95,14 +103,129 @@ class VideoSequenceDataset(Dataset):
         assert self.imagesDir.exists(), f"Images directory not found: {self.imagesDir}"
         assert self.labelsDir.exists(), f"Labels directory not found: {self.labelsDir}"
         
-        # Discover all sequences and their frames
-        self.sequences = self._discoverSequences()
+        # Discover all sequences and their frames (with caching)
+        self.sequences = self._loadOrDiscoverSequences()
         
         # Create list of sequence IDs for indexing
         self.sequenceIds = list(self.sequences.keys())
         
         print(f"[VideoSequenceDataset] Found {len(self.sequences)} sequences "
               f"with {numFrames} frames per sample")
+    
+    def _getCachePath(self) -> Path:
+        """Get the path to the cache file for this dataset."""
+        # Create a hash of the data root to make cache file unique
+        rootHash = hashlib.md5(str(self.dataRoot.resolve()).encode()).hexdigest()[:8]
+        return self.dataRoot / f".viddetr_cache_{rootHash}.json"
+    
+    def _isCacheValid(self, cachePath: Path) -> bool:
+        """Check if the cache file is valid and up-to-date."""
+        if not cachePath.exists():
+            return False
+        
+        try:
+            with open(cachePath, 'r') as f:
+                cache = json.load(f)
+            
+            # Check cache version
+            if cache.get('version') != CACHE_VERSION:
+                print(f"[VideoSequenceDataset] Cache version mismatch, rebuilding...")
+                return False
+            
+            # Check if directories have been modified
+            cacheTime = cache.get('timestamp', 0)
+            imgsDirMtime = os.path.getmtime(self.imagesDir)
+            labelsDirMtime = os.path.getmtime(self.labelsDir)
+            
+            if imgsDirMtime > cacheTime or labelsDirMtime > cacheTime:
+                print(f"[VideoSequenceDataset] Dataset modified since cache, rebuilding...")
+                return False
+            
+            return True
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            print(f"[VideoSequenceDataset] Cache read error: {e}, rebuilding...")
+            return False
+    
+    def _loadOrDiscoverSequences(self) -> Dict[str, List[int]]:
+        """Load sequences from cache or discover them from disk."""
+        cachePath = self._getCachePath()
+        
+        if self.useCache and self._isCacheValid(cachePath):
+            print(f"[VideoSequenceDataset] Loading from cache: {cachePath}")
+            with open(cachePath, 'r') as f:
+                cache = json.load(f)
+            sequences = {k: v for k, v in cache['sequences'].items()}
+            # Filter sequences with enough frames
+            sequences = {
+                seqId: frames 
+                for seqId, frames in sequences.items() 
+                if len(frames) >= self.numFrames
+            }
+            return sequences
+        
+        # Discover sequences from disk
+        print(f"[VideoSequenceDataset] Scanning dataset directory...")
+        sequences = self._discoverSequences()
+        
+        # Save to cache
+        if self.useCache:
+            self._saveCache(cachePath, sequences)
+        
+        return sequences
+    
+    def _saveCache(self, cachePath: Path, sequences: Dict[str, List[int]]) -> None:
+        """Save discovered sequences to cache file."""
+        try:
+            # Include all sequences in cache (before filtering by numFrames)
+            # so cache can be reused with different numFrames settings
+            allSequences = self._discoverSequencesUnfiltered()
+            
+            cache = {
+                'version': CACHE_VERSION,
+                'timestamp': max(
+                    os.path.getmtime(self.imagesDir),
+                    os.path.getmtime(self.labelsDir)
+                ),
+                'dataRoot': str(self.dataRoot.resolve()),
+                'numSequences': len(allSequences),
+                'sequences': allSequences
+            }
+            
+            with open(cachePath, 'w') as f:
+                json.dump(cache, f)
+            
+            print(f"[VideoSequenceDataset] Cache saved: {cachePath}")
+        except OSError as e:
+            print(f"[VideoSequenceDataset] Failed to save cache: {e}")
+    
+    def _discoverSequencesUnfiltered(self) -> Dict[str, List[int]]:
+        """Discover all sequences without filtering by numFrames."""
+        sequences = {}
+        imageExtensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+        
+        for imgFile in self.imagesDir.iterdir():
+            if imgFile.suffix.lower() not in imageExtensions:
+                continue
+            
+            match = self.FILENAME_PATTERN.match(imgFile.stem)
+            if not match:
+                continue
+            
+            seqId = match.group(1)
+            frameIdx = int(match.group(2))
+            
+            labelFile = self.labelsDir / f"seq_{seqId}_frame_{frameIdx:04d}.txt"
+            if not labelFile.exists():
+                continue
+            
+            if seqId not in sequences:
+                sequences[seqId] = []
+            sequences[seqId].append(frameIdx)
+        
+        for seqId in sequences:
+            sequences[seqId] = sorted(sequences[seqId])
+        
+        return sequences
     
     def _discoverSequences(self) -> Dict[str, List[int]]:
         """
@@ -111,36 +234,7 @@ class VideoSequenceDataset(Dataset):
         Returns:
             Dictionary mapping sequence ID to list of frame indices
         """
-        sequences = {}
-        
-        # Scan images directory for all image files
-        imageExtensions = {'.jpg', '.jpeg', '.png', '.bmp'}
-        
-        for imgFile in self.imagesDir.iterdir():
-            if imgFile.suffix.lower() not in imageExtensions:
-                continue
-            
-            # Parse filename to extract sequence and frame IDs
-            match = self.FILENAME_PATTERN.match(imgFile.stem)
-            if not match:
-                continue
-            
-            seqId = match.group(1)
-            frameIdx = int(match.group(2))
-            
-            # Check if corresponding label file exists
-            labelFile = self.labelsDir / f"seq_{seqId}_frame_{frameIdx:04d}.txt"
-            if not labelFile.exists():
-                continue
-            
-            # Add to sequences dictionary
-            if seqId not in sequences:
-                sequences[seqId] = []
-            sequences[seqId].append(frameIdx)
-        
-        # Sort frame indices for each sequence
-        for seqId in sequences:
-            sequences[seqId] = sorted(sequences[seqId])
+        sequences = self._discoverSequencesUnfiltered()
         
         # Filter sequences with enough frames
         sequences = {
@@ -319,10 +413,22 @@ class VideoSequenceDataset(Dataset):
             )
             
             # Prepare target dict
+            # Note: We need 'iscrowd' and 'area' fields for DETR transforms compatibility
+            numBoxes = len(boxes)
+            
+            # Compute area from normalized cxcywh boxes (w * h * imgW * imgH)
+            if numBoxes > 0:
+                # boxes are in cxcywh normalized format
+                area = boxes[:, 2] * boxes[:, 3] * imgWidth * imgHeight
+            else:
+                area = torch.zeros((0,), dtype=torch.float32)
+            
             target = {
                 'boxes': boxes,  # cxcywh normalized
                 'labels': labels,
                 'trackIds': trackIds,
+                'iscrowd': torch.zeros((numBoxes,), dtype=torch.int64),  # No crowd annotations
+                'area': area,
                 'frameIdx': torch.tensor([clipFrameIdx]),
                 'origSize': torch.tensor([imgHeight, imgWidth]),
                 'size': torch.tensor([imgHeight, imgWidth]),
@@ -332,7 +438,7 @@ class VideoSequenceDataset(Dataset):
             }
             
             # Convert boxes from cxcywh to xyxy for transforms (then back)
-            if len(boxes) > 0:
+            if numBoxes > 0:
                 # Convert normalized cxcywh to absolute xyxy for transforms
                 boxesXyxy = self._cxcywhToXyxy(boxes, imgWidth, imgHeight)
                 target['boxes'] = boxesXyxy

@@ -104,7 +104,7 @@ class VideoHungarianMatcher(nn.Module):
                 predBoxes = outputs['pred_boxes'][batchIdx, startQuery:endQuery]
                 
                 # Get targets for this frame
-                target = targets[batchIdx][frameIdx]
+                target = targets[frameIdx][batchIdx]
                 
                 # Handle empty targets
                 if len(target['labels']) == 0:
@@ -228,8 +228,8 @@ class VideoCriterion(nn.Module):
             dtype=torch.int64, 
             device=device
         )
-        
         # Fill in matched targets
+        # Note: targets are organized as [frameIdx][batchIdx] (frame-first)
         for batchIdx in range(batchSize):
             for frameIdx in range(self.numFrames):
                 srcIdx, tgtIdx = indices[batchIdx][frameIdx]
@@ -240,8 +240,8 @@ class VideoCriterion(nn.Module):
                 # Convert frame-local indices to global query indices
                 globalSrcIdx = srcIdx + frameIdx * self.queriesPerFrame
                 
-                # Get target labels
-                tgtLabels = targets[batchIdx][frameIdx]['labels'][tgtIdx]
+                # Get target labels (targets are frame-first: targets[frameIdx][batchIdx])
+                tgtLabels = targets[frameIdx][batchIdx]['labels'][tgtIdx]
                 targetClasses[batchIdx, globalSrcIdx] = tgtLabels.to(device)
         
         # Compute cross-entropy loss
@@ -269,7 +269,7 @@ class VideoCriterion(nn.Module):
                             globalSrcIdx
                         ))
                         allTgtLabels.append(
-                            targets[batchIdx][frameIdx]['labels'][tgtIdx]
+                            targets[frameIdx][batchIdx]['labels'][tgtIdx]
                         )
             
             if allSrcIdx:
@@ -303,6 +303,7 @@ class VideoCriterion(nn.Module):
         
         batchSize = outputs['pred_boxes'].shape[0]
         
+        # Note: targets are organized as [frameIdx][batchIdx] (frame-first)
         for batchIdx in range(batchSize):
             for frameIdx in range(self.numFrames):
                 srcIdx, tgtIdx = indices[batchIdx][frameIdx]
@@ -314,7 +315,7 @@ class VideoCriterion(nn.Module):
                 globalSrcIdx = srcIdx + frameIdx * self.queriesPerFrame
                 
                 srcBoxes.append(outputs['pred_boxes'][batchIdx, globalSrcIdx])
-                tgtBoxes.append(targets[batchIdx][frameIdx]['boxes'][tgtIdx].to(device))
+                tgtBoxes.append(targets[frameIdx][batchIdx]['boxes'][tgtIdx].to(device))
         
         if not srcBoxes:
             return {
@@ -352,11 +353,14 @@ class VideoCriterion(nn.Module):
         """
         predLogits = outputs['pred_logits']
         device = predLogits.device
+        batchSize = predLogits.shape[0]
+        numFrames = len(targets)  # targets is [numFrames][batchSize]
         
         # Count target boxes per batch
+        # Note: targets are organized as [frameIdx][batchIdx] (frame-first)
         tgtLengths = []
-        for batchTargets in targets:
-            totalBoxes = sum(len(t['labels']) for t in batchTargets)
+        for batchIdx in range(batchSize):
+            totalBoxes = sum(len(targets[frameIdx][batchIdx]['labels']) for frameIdx in range(numFrames))
             tgtLengths.append(totalBoxes)
         tgtLengths = torch.as_tensor(tgtLengths, device=device)
         
@@ -392,6 +396,7 @@ class VideoCriterion(nn.Module):
         # We need unique track IDs across batches
         trackIdOffset = 0
         
+        # Note: targets are organized as [frameIdx][batchIdx] (frame-first)
         for batchIdx in range(batchSize):
             maxTrackId = 0
             
@@ -405,8 +410,8 @@ class VideoCriterion(nn.Module):
                 globalSrcIdx = srcIdx + frameIdx * self.queriesPerFrame
                 embeddings = outputs['pred_tracking'][batchIdx, globalSrcIdx]
                 
-                # Get track IDs (from target annotations)
-                trackIds = targets[batchIdx][frameIdx]['trackIds'][tgtIdx]
+                # Get track IDs (from target annotations, frame-first indexing)
+                trackIds = targets[frameIdx][batchIdx]['trackIds'][tgtIdx]
                 trackIds = trackIds.to(device) + trackIdOffset
                 
                 # Frame indices
@@ -482,7 +487,7 @@ class VideoCriterion(nn.Module):
         
         Args:
             outputs: Model outputs dict
-            targets: List of B lists of numFrames target dicts
+            targets: List of numFrames lists of B target dicts (frame-first: targets[frameIdx][batchIdx])
         
         Returns:
             Dict of all losses
@@ -494,9 +499,11 @@ class VideoCriterion(nn.Module):
         indices = self.matcher(outputsWithoutAux, targets)
         
         # Count total target boxes for normalization
+        # Note: targets are organized as [frameIdx][batchIdx] (frame-first)
         numBoxes = sum(
-            sum(len(t['labels']) for t in batchTargets)
-            for batchTargets in targets
+            len(t['labels'])
+            for frameTargets in targets
+            for t in frameTargets
         )
         numBoxes = torch.as_tensor(
             [numBoxes], 

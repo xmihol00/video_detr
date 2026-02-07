@@ -23,6 +23,10 @@ def crop(image, target, region):
     target["size"] = torch.tensor([h, w])
 
     fields = ["labels", "area", "iscrowd"]
+    
+    # Add trackIds for VideoDETR compatibility if present
+    if "trackIds" in target:
+        fields.append("trackIds")
 
     if "boxes" in target:
         boxes = target["boxes"]

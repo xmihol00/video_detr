@@ -43,7 +43,7 @@ from vidDetr.engine import trainOneEpoch, evaluate
 import safe_gpu
 while True:
     try:
-        safe_gpu.claim_gpus(2)
+        safe_gpu.claim_gpus(1)
         break
     except:
         print("Waiting for free GPU")
@@ -67,7 +67,7 @@ def getArgsParser():
                         help='Base learning rate')
     parser.add_argument('--lrBackbone', default=1e-5, type=float,
                         help='Learning rate for backbone')
-    parser.add_argument('--batchSize', default=1, type=int,
+    parser.add_argument('--batchSize', default=2, type=int,
                         help='Batch size per GPU')
     parser.add_argument('--weightDecay', default=1e-4, type=float,
                         help='Weight decay')
