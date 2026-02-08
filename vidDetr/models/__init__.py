@@ -5,11 +5,13 @@
 from .video_detr import VideoDETR, buildVideoDETR
 from .temporal_encoding import TemporalPositionEncoding, buildTemporalEncoding
 from .tracking_head import TrackingHead
+from .denoising import DenoisingGenerator
 
 __all__ = [
     'VideoDETR', 
     'buildVideoDETR',
     'TemporalPositionEncoding',
     'buildTemporalEncoding',
-    'TrackingHead'
+    'TrackingHead',
+    'DenoisingGenerator'
 ]

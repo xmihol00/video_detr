@@ -32,6 +32,7 @@ from models.transformer import build_transformer
 
 from .temporal_encoding import TemporalPositionEncoding, buildTemporalEncoding
 from .tracking_head import TrackingHead
+from .denoising import DenoisingGenerator
 
 
 class MLP(nn.Module):
@@ -90,7 +91,12 @@ class VideoDETR(nn.Module):
         queriesPerFrame: int = 75,
         auxLoss: bool = True,
         trackingEmbedDim: int = 128,
-        temporalType: str = 'learned'
+        temporalType: str = 'learned',
+        # Label denoising params
+        useDnDenoising: bool = True,
+        numDnGroups: int = 5,
+        labelNoiseRatio: float = 0.5,
+        boxNoiseScale: float = 0.4
     ):
         super().__init__()
         
@@ -99,6 +105,7 @@ class VideoDETR(nn.Module):
         self.numQueries = numFrames * queriesPerFrame
         self.auxLoss = auxLoss
         self.numClasses = numClasses
+        self.useDnDenoising = useDnDenoising
         
         # Core components
         self.backbone = backbone
@@ -137,6 +144,23 @@ class VideoDETR(nn.Module):
             numLayers=3,
             normalize=True
         )
+        
+        # Label denoising generator (DN-DETR / DINO style)
+        if useDnDenoising:
+            self.denoisingGenerator = DenoisingGenerator(
+                hiddenDim=hiddenDim,
+                numClasses=numClasses,
+                numDnGroups=numDnGroups,
+                labelNoiseRatio=labelNoiseRatio,
+                boxNoiseScale=boxNoiseScale,
+                numFrames=numFrames,
+                queriesPerFrame=queriesPerFrame
+            )
+            print(f"[VideoDETR] Label denoising enabled: "
+                  f"{numDnGroups} groups, label_noise={labelNoiseRatio}, "
+                  f"box_noise={boxNoiseScale}")
+        else:
+            self.denoisingGenerator = None
         
         self._initializeQueryEmbeddings()
     
@@ -178,7 +202,8 @@ class VideoDETR(nn.Module):
     
     def forward(
         self,
-        samples: List[NestedTensor]
+        samples: List[NestedTensor],
+        targets: Optional[List[List[Dict[str, Tensor]]]] = None
     ) -> Dict[str, Tensor]:
         """
         Forward pass for VideoDETR.
@@ -186,6 +211,9 @@ class VideoDETR(nn.Module):
         Args:
             samples: List of N NestedTensors, one per frame. Each NestedTensor
                     contains batched images [B, 3, H, W] and masks [B, H, W]
+            targets: Optional frame-first targets for denoising training.
+                    targets[frameIdx][batchIdx] = dict with 'labels', 'boxes', etc.
+                    Only needed during training when useDnDenoising=True.
         
         Returns:
             Dict with:
@@ -193,6 +221,10 @@ class VideoDETR(nn.Module):
             - 'pred_boxes': Box predictions [B, numQueries, 4] in cxcywh format
             - 'pred_tracking': Tracking embeddings [B, numQueries, trackingEmbedDim]
             - 'aux_outputs': Optional list of intermediate predictions
+            - 'dn_meta': Optional denoising metadata (training only)
+            - 'dn_pred_logits': Optional DN classification logits (training only)
+            - 'dn_pred_boxes': Optional DN box predictions (training only)
+            - 'dn_aux_outputs': Optional DN auxiliary outputs (training only)
         """
         # Validate input
         assert len(samples) == self.numFrames, \
@@ -235,10 +267,6 @@ class VideoDETR(nn.Module):
             allPositions.append(combinedPos)
             allMasks.append(mask)
         
-        # Concatenate features from all frames along spatial dimension
-        # Shape: [B, C, H, W] -> [B, C, H*numFrames, W] (or flattened differently)
-        # Actually, we need to flatten and concatenate for the transformer
-        
         batchSize = allFeatures[0].shape[0]
         
         # Flatten each frame: [B, C, H, W] -> [H*W, B, C]
@@ -247,7 +275,6 @@ class VideoDETR(nn.Module):
         flatMasks = []
         
         for src, pos, mask in zip(allFeatures, allPositions, allMasks):
-            # Flatten spatial dimensions
             srcFlat = src.flatten(2).permute(2, 0, 1)  # [H*W, B, C]
             posFlat = pos.flatten(2).permute(2, 0, 1)  # [H*W, B, C]
             maskFlat = mask.flatten(1)  # [B, H*W]
@@ -256,18 +283,30 @@ class VideoDETR(nn.Module):
             flatPositions.append(posFlat)
             flatMasks.append(maskFlat)
         
-        # Concatenate along sequence dimension
-        # [H*W*numFrames, B, C]
+        # Concatenate along sequence dimension: [H*W*numFrames, B, C]
         srcConcat = torch.cat(flatFeatures, dim=0)
         posConcat = torch.cat(flatPositions, dim=0)
         maskConcat = torch.cat(flatMasks, dim=1)  # [B, H*W*numFrames]
         
-        # Get query embeddings with frame-specific components
-        queryEmbed = self._getFrameQueries()  # [numQueries, hiddenDim]
-        queryEmbed = queryEmbed.unsqueeze(1).repeat(1, batchSize, 1)  # [numQueries, B, hiddenDim]
+        # Get matching query embeddings with frame-specific components
+        matchQueryEmbed = self._getFrameQueries()  # [numQueries, hiddenDim]
+        matchQueryEmbed = matchQueryEmbed.unsqueeze(1).repeat(1, batchSize, 1)  # [numQueries, B, hiddenDim]
+        matchTgt = torch.zeros_like(matchQueryEmbed)
         
-        # Initialize target queries (zeros, will be filled by decoder)
-        tgt = torch.zeros_like(queryEmbed)
+        # ---- Label Denoising (training only) ----
+        dnInfo = None
+        if self.training and self.useDnDenoising and self.denoisingGenerator is not None and targets is not None:
+            dnInfo = self.denoisingGenerator(targets, srcConcat.device)
+        
+        if dnInfo is not None:
+            # Prepend denoising queries: [dnQueries + matchQueries, B, hiddenDim]
+            tgt = torch.cat([dnInfo['dn_query_content'], matchTgt], dim=0)
+            queryEmbed = torch.cat([dnInfo['dn_query_pos'], matchQueryEmbed], dim=0)
+            attnMask = dnInfo['dn_attn_mask']  # [totalQueries, totalQueries]
+        else:
+            tgt = matchTgt
+            queryEmbed = matchQueryEmbed
+            attnMask = None
         
         # Run transformer encoder
         memory = self.transformer.encoder(
@@ -276,23 +315,32 @@ class VideoDETR(nn.Module):
             pos=posConcat
         )
         
-        # Run transformer decoder
-        # hs shape: [numDecoderLayers, B, numQueries, hiddenDim]
+        # Run transformer decoder with attention mask
+        # hs shape: [numDecoderLayers, totalQueries, B, hiddenDim]
         hs = self.transformer.decoder(
             tgt,
             memory,
+            tgt_mask=attnMask,
             memory_key_padding_mask=maskConcat,
             pos=posConcat,
             query_pos=queryEmbed
         )
         
-        # Transpose to [numDecoderLayers, B, numQueries, hiddenDim]
+        # Transpose to [numDecoderLayers, B, totalQueries, hiddenDim]
         hs = hs.transpose(1, 2)
         
-        # Compute outputs
-        outputsClass = self.classEmbed(hs)  # [numLayers, B, numQueries, numClasses+1]
-        outputsCoord = self.bboxEmbed(hs).sigmoid()  # [numLayers, B, numQueries, 4]
-        outputsTracking = self.trackingHead(hs)  # [numLayers, B, numQueries, trackingDim]
+        # ---- Split DN and matching outputs ----
+        if dnInfo is not None:
+            dnMeta = dnInfo['dn_meta']
+            dnHs, matchHs = self.denoisingGenerator.splitDnOutputs(hs, dnMeta)
+        else:
+            dnMeta = None
+            matchHs = hs
+        
+        # Compute matching outputs (same as before)
+        outputsClass = self.classEmbed(matchHs)  # [numLayers, B, numQueries, numClasses+1]
+        outputsCoord = self.bboxEmbed(matchHs).sigmoid()  # [numLayers, B, numQueries, 4]
+        outputsTracking = self.trackingHead(matchHs)  # [numLayers, B, numQueries, trackingDim]
         
         # Build output dict (using last decoder layer)
         out = {
@@ -306,6 +354,26 @@ class VideoDETR(nn.Module):
             out['aux_outputs'] = self._setAuxLoss(
                 outputsClass, outputsCoord, outputsTracking
             )
+        
+        # ---- Add denoising outputs (training only) ----
+        if dnMeta is not None:
+            # Apply same detection heads to DN outputs
+            dnOutputsClass = self.classEmbed(dnHs)  # [numLayers, B, dnQueries, numClasses+1]
+            dnOutputsCoord = self.bboxEmbed(dnHs).sigmoid()  # [numLayers, B, dnQueries, 4]
+            
+            out['dn_pred_logits'] = dnOutputsClass[-1]
+            out['dn_pred_boxes'] = dnOutputsCoord[-1]
+            out['dn_meta'] = dnMeta
+            
+            # DN auxiliary outputs
+            if self.auxLoss:
+                out['dn_aux_outputs'] = [
+                    {
+                        'dn_pred_logits': dnOutputsClass[i],
+                        'dn_pred_boxes': dnOutputsCoord[i],
+                    }
+                    for i in range(dnOutputsClass.shape[0] - 1)
+                ]
         
         return out
     
@@ -391,7 +459,11 @@ def buildVideoDETR(args) -> Tuple[VideoDETR, nn.Module, Dict[str, nn.Module]]:
         queriesPerFrame=args.queriesPerFrame,
         auxLoss=args.auxLoss,
         trackingEmbedDim=getattr(args, 'trackingEmbedDim', 128),
-        temporalType=getattr(args, 'temporalEncoding', 'learned')
+        temporalType=getattr(args, 'temporalEncoding', 'learned'),
+        useDnDenoising=getattr(args, 'useDnDenoising', True),
+        numDnGroups=getattr(args, 'numDnGroups', 5),
+        labelNoiseRatio=getattr(args, 'labelNoiseRatio', 0.5),
+        boxNoiseScale=getattr(args, 'boxNoiseScale', 0.4)
     )
     
     # Build criterion

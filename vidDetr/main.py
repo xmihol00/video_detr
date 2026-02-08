@@ -69,7 +69,7 @@ def getArgsParser():
                         help='Base learning rate')
     parser.add_argument('--lrBackbone', default=1e-5, type=float,
                         help='Learning rate for backbone')
-    parser.add_argument('--batchSize', default=12, type=int,
+    parser.add_argument('--batchSize', default=7, type=int,
                         help='Batch size per GPU')
     parser.add_argument('--weightDecay', default=1e-4, type=float,
                         help='Weight decay')
@@ -158,6 +158,20 @@ def getArgsParser():
     parser.add_argument('--contrastiveTemp', default=0.07, type=float,
                         help='Temperature for contrastive loss')
     
+    # Label denoising (DN-DETR / DINO) parameters
+    parser.add_argument('--useDnDenoising', action='store_true', default=True,
+                        help='Use label denoising for training stabilization')
+    parser.add_argument('--noDnDenoising', dest='useDnDenoising', action='store_false',
+                        help='Disable label denoising')
+    parser.add_argument('--numDnGroups', default=5, type=int,
+                        help='Number of denoising groups (each group = noised copy of all GTs)')
+    parser.add_argument('--labelNoiseRatio', default=0.5, type=float,
+                        help='Probability of flipping a label to random class in DN queries')
+    parser.add_argument('--boxNoiseScale', default=0.4, type=float,
+                        help='Scale of box coordinate noise (fraction of box size)')
+    parser.add_argument('--dnLossCoef', default=1.0, type=float,
+                        help='Coefficient for denoising losses (multiplied with base loss coefs)')
+    
     # Dataset parameters
     parser.add_argument('--dataConfig', default='vidDetr/data.yaml', type=str,
                         help='Path to dataset configuration YAML')
@@ -169,7 +183,7 @@ def getArgsParser():
                         help='Minimum gap between sampled frames')
     parser.add_argument('--maxFrameGap', default=10, type=int,
                         help='Maximum gap between sampled frames')
-    parser.add_argument('--maxSize', default=480, type=int,
+    parser.add_argument('--maxSize', default=512, type=int,
                         help='Maximum image size after transforms')
     
     # Training parameters
@@ -185,7 +199,7 @@ def getArgsParser():
                         help='Starting epoch number')
     parser.add_argument('--eval', action='store_true',
                         help='Run evaluation only')
-    parser.add_argument('--numWorkers', default=2, type=int,
+    parser.add_argument('--numWorkers', default=4, type=int,
                         help='Number of dataloader workers')
     
     # Distributed training

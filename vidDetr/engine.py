@@ -78,8 +78,8 @@ def trainOneEpoch(
                     if isinstance(v, torch.Tensor):
                         frameTarget[k] = v.to(device)
         
-        # Forward pass
-        outputs = model(samples)
+        # Forward pass (pass targets for label denoising during training)
+        outputs = model(samples, targets=targets)
         
         # Compute losses
         lossDict = criterion(outputs, targets)
@@ -198,7 +198,7 @@ def evaluate(
                     if isinstance(v, torch.Tensor):
                         frameTarget[k] = v.to(device)
         
-        # Forward pass
+        # Forward pass (no targets needed - denoising is training only)
         outputs = model(samples)
         
         # Compute losses

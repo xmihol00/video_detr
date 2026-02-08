@@ -563,8 +563,12 @@ class VideoCriterion(nn.Module):
         Returns:
             Dict of all losses
         """
-        # Filter out auxiliary outputs for matching
-        outputsWithoutAux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        # Filter out auxiliary outputs and denoising outputs for matching
+        outputsWithoutAux = {
+            k: v for k, v in outputs.items() 
+            if k not in ('aux_outputs', 'dn_pred_logits', 'dn_pred_boxes', 
+                         'dn_meta', 'dn_aux_outputs')
+        }
         
         # Perform Hungarian matching
         indices = self.matcher(outputsWithoutAux, targets)
@@ -586,7 +590,7 @@ class VideoCriterion(nn.Module):
             torch.distributed.all_reduce(numBoxes)
         numBoxes = torch.clamp(numBoxes / get_world_size(), min=1).item()
         
-        # Compute all losses
+        # Compute all matching losses
         losses = {}
         for loss in self.losses:
             kwargs = {}
@@ -612,7 +616,107 @@ class VideoCriterion(nn.Module):
                     lDict = {k + f'_{i}': v for k, v in lDict.items()}
                     losses.update(lDict)
         
+        # ---- Label Denoising Losses (training only) ----
+        if 'dn_meta' in outputs and outputs['dn_meta'] is not None:
+            dnLosses = self._computeDenoisingLoss(outputs, numBoxes)
+            losses.update(dnLosses)
+            
+            # Auxiliary DN losses
+            if 'dn_aux_outputs' in outputs:
+                for i, dnAuxOutputs in enumerate(outputs['dn_aux_outputs']):
+                    auxDnLosses = self._computeDenoisingLoss(
+                        {
+                            'dn_pred_logits': dnAuxOutputs['dn_pred_logits'],
+                            'dn_pred_boxes': dnAuxOutputs['dn_pred_boxes'],
+                            'dn_meta': outputs['dn_meta'],
+                        },
+                        numBoxes
+                    )
+                    auxDnLosses = {k + f'_{i}': v for k, v in auxDnLosses.items()}
+                    losses.update(auxDnLosses)
+        
         return losses
+    
+    def _computeDenoisingLoss(
+        self,
+        outputs: Dict[str, Tensor],
+        numBoxes: float
+    ) -> Dict[str, Tensor]:
+        """
+        Compute denoising losses directly (no Hungarian matching needed).
+        
+        The DN queries have a known correspondence to GT objects, so we compute
+        classification and box regression losses directly.
+        
+        Args:
+            outputs: Must contain 'dn_pred_logits', 'dn_pred_boxes', 'dn_meta'
+            numBoxes: Normalization factor
+            
+        Returns:
+            Dict with 'loss_dn_ce' and 'loss_dn_bbox', 'loss_dn_giou'
+        """
+        dnPredLogits = outputs['dn_pred_logits']  # [B, totalDnQueries, numClasses+1]
+        dnPredBoxes = outputs['dn_pred_boxes']  # [B, totalDnQueries, 4]
+        dnMeta = outputs['dn_meta']
+        
+        device = dnPredLogits.device
+        batchSize = dnPredLogits.shape[0]
+        
+        # Get known GT labels and boxes
+        knownLabels = dnMeta['known_labels'].to(device)  # [B, totalDnQueries]
+        knownBoxes = dnMeta['known_boxes'].to(device)  # [B, totalDnQueries, 4]
+        validMask = dnMeta['dn_valid_mask'].to(device)  # [B, totalDnQueries]
+        
+        # ---- Classification loss ----
+        if self.useFocalLoss:
+            # Build one-hot targets
+            targetClassesOnehot = torch.zeros_like(dnPredLogits)
+            targetClassesOnehot.scatter_(2, knownLabels.unsqueeze(-1), 1)
+            
+            # Mask out invalid (padded) queries: set them to no-object
+            # For invalid queries, we zero-out the one-hot (all zeros = no-object for sigmoid)
+            targetClassesOnehot = targetClassesOnehot * validMask.unsqueeze(-1).float()
+            
+            lossDnCe = sigmoidFocalLoss(
+                dnPredLogits, targetClassesOnehot, numBoxes,
+                alpha=self.focalAlpha, gamma=self.focalGamma
+            )
+        else:
+            # Cross-entropy: set invalid to no-object class
+            targetLabels = knownLabels.clone()
+            targetLabels[~validMask] = self.numClasses
+            
+            lossDnCe = F.cross_entropy(
+                dnPredLogits.transpose(1, 2),
+                targetLabels,
+                self.emptyWeight.to(device)
+            )
+        
+        # ---- Box losses (only for valid queries) ----
+        if validMask.any():
+            # Get valid predictions and targets
+            validPredBoxes = dnPredBoxes[validMask]  # [numValid, 4]
+            validTgtBoxes = knownBoxes[validMask]  # [numValid, 4]
+            
+            # L1 loss
+            lossDnBbox = F.l1_loss(validPredBoxes, validTgtBoxes, reduction='none')
+            lossDnBbox = lossDnBbox.sum() / numBoxes
+            
+            # GIoU loss
+            lossDnGiou = 1 - torch.diag(box_ops.generalized_box_iou(
+                box_ops.box_cxcywh_to_xyxy(validPredBoxes),
+                box_ops.box_cxcywh_to_xyxy(validTgtBoxes)
+            ))
+            lossDnGiou = lossDnGiou.sum() / numBoxes
+        else:
+            lossDnBbox = torch.tensor(0.0, device=device, requires_grad=True)
+            lossDnGiou = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        return {
+            'loss_dn_ce': lossDnCe,
+            'loss_dn_bbox': lossDnBbox,
+            'loss_dn_giou': lossDnGiou,
+        }
 
 
 class PostProcess(nn.Module):
@@ -692,6 +796,7 @@ def buildVideoCriterion(args) -> VideoCriterion:
     )
     
     useFocalLoss = getattr(args, 'useFocalLoss', True)
+    useDnDenoising = getattr(args, 'useDnDenoising', True)
     
     # Build weight dict
     # With focal loss, the CE weight needs to be higher since focal loss 
@@ -704,6 +809,13 @@ def buildVideoCriterion(args) -> VideoCriterion:
         'loss_giou': args.giouLossCoef,
         'loss_tracking': getattr(args, 'trackingLossCoef', 1.0)
     }
+    
+    # Add denoising loss weights (same coefficients as matching losses)
+    if useDnDenoising:
+        dnLossCoef = getattr(args, 'dnLossCoef', 1.0)
+        weightDict['loss_dn_ce'] = ceLossCoef * dnLossCoef
+        weightDict['loss_dn_bbox'] = args.bboxLossCoef * dnLossCoef
+        weightDict['loss_dn_giou'] = args.giouLossCoef * dnLossCoef
     
     # Add auxiliary loss weights
     if args.auxLoss:

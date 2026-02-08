@@ -362,6 +362,13 @@ def testVideoDETRModel():
         focalAlpha = 0.25
         focalGamma = 2.0
         
+        # Denoising
+        useDnDenoising = True
+        numDnGroups = 3
+        labelNoiseRatio = 0.5
+        boxNoiseScale = 0.4
+        dnLossCoef = 1.0
+        
         device = 'cpu'
     
     args = Args()
@@ -390,7 +397,11 @@ def testVideoDETRModel():
         queriesPerFrame=args.queriesPerFrame,
         auxLoss=args.auxLoss,
         trackingEmbedDim=args.trackingEmbedDim,
-        temporalType=args.temporalEncoding
+        temporalType=args.temporalEncoding,
+        useDnDenoising=args.useDnDenoising,
+        numDnGroups=args.numDnGroups,
+        labelNoiseRatio=args.labelNoiseRatio,
+        boxNoiseScale=args.boxNoiseScale
     )
     
     # Count parameters
@@ -451,13 +462,23 @@ def testVideoDETRModel():
         targets.append(frameTargets)
     
     model.train()
-    outputs = model(samples)
+    outputs = model(samples, targets=targets)
     losses = criterion(outputs, targets)
     
     print("   Losses:")
     for k, v in sorted(losses.items()):
         if not k.endswith('_unscaled'):
             print(f"     {k}: {v.item():.4f}")
+    
+    # Verify denoising outputs are present
+    if args.useDnDenoising:
+        assert 'dn_pred_logits' in outputs, "DN logits missing from outputs"
+        assert 'dn_pred_boxes' in outputs, "DN boxes missing from outputs"
+        assert 'dn_meta' in outputs, "DN meta missing from outputs"
+        assert 'loss_dn_ce' in losses, "DN CE loss missing"
+        assert 'loss_dn_bbox' in losses, "DN bbox loss missing"
+        assert 'loss_dn_giou' in losses, "DN GIoU loss missing"
+        print("   ✓ Denoising outputs and losses present")
     
     # Test backward
     totalLoss = sum(
@@ -472,6 +493,145 @@ def testVideoDETRModel():
     print("\n✓ All VideoDETR model tests passed!")
 
 
+def testDenoising():
+    """Test the label denoising module."""
+    print("\n" + "=" * 60)
+    print("Testing Label Denoising (DN-DETR style)")
+    print("=" * 60)
+    
+    from vidDetr.models.denoising import DenoisingGenerator
+    
+    hiddenDim = 256
+    numClasses = 10
+    numFrames = 3
+    queriesPerFrame = 10
+    numDnGroups = 3
+    batchSize = 2
+    
+    generator = DenoisingGenerator(
+        hiddenDim=hiddenDim,
+        numClasses=numClasses,
+        numDnGroups=numDnGroups,
+        labelNoiseRatio=0.5,
+        boxNoiseScale=0.4,
+        numFrames=numFrames,
+        queriesPerFrame=queriesPerFrame
+    )
+    generator.train()
+    
+    # Create targets in frame-first format with varying GT counts
+    targets = []
+    for f in range(numFrames):
+        frameTargets = []
+        for b in range(batchSize):
+            ngt = 2 + b  # Different GT counts per batch
+            frameTarget = {
+                'labels': torch.randint(0, numClasses, (ngt,)),
+                'boxes': torch.rand(ngt, 4).clamp(0.1, 0.9),  # Valid cxcywh
+                'trackIds': torch.arange(ngt)
+            }
+            frameTargets.append(frameTarget)
+        targets.append(frameTargets)
+    
+    print("\n1. Testing denoising query generation...")
+    device = torch.device('cpu')
+    dnInfo = generator(targets, device)
+    
+    assert dnInfo is not None, "DN info should not be None when GT exists"
+    
+    dnContent = dnInfo['dn_query_content']
+    dnPos = dnInfo['dn_query_pos']
+    attnMask = dnInfo['dn_attn_mask']
+    dnMeta = dnInfo['dn_meta']
+    
+    maxGt = dnMeta['max_gt_per_frame']
+    totalDnQueries = dnMeta['dn_num_queries']
+    expectedDnQueries = maxGt * numFrames * numDnGroups
+    
+    print(f"   Max GT per frame: {maxGt}")
+    print(f"   Total DN queries: {totalDnQueries}")
+    print(f"   DN content shape: {dnContent.shape}")
+    print(f"   DN pos shape: {dnPos.shape}")
+    print(f"   Attention mask shape: {attnMask.shape}")
+    
+    assert totalDnQueries == expectedDnQueries
+    assert dnContent.shape == (totalDnQueries, batchSize, hiddenDim)
+    assert dnPos.shape == (totalDnQueries, batchSize, hiddenDim)
+    
+    totalQueries = totalDnQueries + numFrames * queriesPerFrame
+    assert attnMask.shape == (totalQueries, totalQueries)
+    print("   ✓ DN query shapes correct")
+    
+    print("\n2. Testing attention mask structure...")
+    # DN queries should NOT attend to matching queries
+    assert attnMask[:totalDnQueries, totalDnQueries:].all(), \
+        "DN queries must not attend to matching queries"
+    # Matching queries should NOT attend to DN queries
+    assert attnMask[totalDnQueries:, :totalDnQueries].all(), \
+        "Matching queries must not attend to DN queries"
+    # Matching queries CAN attend to each other
+    assert not attnMask[totalDnQueries:, totalDnQueries:].any(), \
+        "Matching queries should attend to each other"
+    # Within same DN group, queries CAN attend to each other
+    groupSize = maxGt * numFrames
+    for g in range(numDnGroups):
+        start = g * groupSize
+        end = (g + 1) * groupSize
+        assert not attnMask[start:end, start:end].any(), \
+            f"Within-group attention should be allowed for group {g}"
+    # Different DN groups should NOT attend to each other
+    if numDnGroups > 1:
+        assert attnMask[0:groupSize, groupSize:2*groupSize].all(), \
+            "Different DN groups must not attend to each other"
+    print("   ✓ Attention mask structure correct")
+    
+    print("\n3. Testing valid mask...")
+    validMask = dnMeta['dn_valid_mask']  # [B, totalDnQueries]
+    assert validMask.shape == (batchSize, totalDnQueries)
+    # Batch 0 has 2 GT, batch 1 has 3 GT, maxGt=3
+    # Each group has numFrames * maxGt queries
+    # For batch 0: 2 valid + 1 padded per frame, for batch 1: 3 valid per frame
+    totalValidB0 = 2 * numFrames * numDnGroups
+    totalValidB1 = 3 * numFrames * numDnGroups
+    assert validMask[0].sum().item() == totalValidB0, \
+        f"Expected {totalValidB0} valid for batch 0, got {validMask[0].sum().item()}"
+    assert validMask[1].sum().item() == totalValidB1, \
+        f"Expected {totalValidB1} valid for batch 1, got {validMask[1].sum().item()}"
+    print(f"   Batch 0 valid: {validMask[0].sum().item()}/{totalDnQueries}")
+    print(f"   Batch 1 valid: {validMask[1].sum().item()}/{totalDnQueries}")
+    print("   ✓ Valid mask correct")
+    
+    print("\n4. Testing split outputs...")
+    # Simulate decoder output
+    numLayers = 3
+    hs = torch.randn(numLayers, batchSize, totalQueries, hiddenDim)
+    dnHs, matchHs = generator.splitDnOutputs(hs, dnMeta)
+    assert dnHs.shape == (numLayers, batchSize, totalDnQueries, hiddenDim)
+    assert matchHs.shape == (numLayers, batchSize, numFrames * queriesPerFrame, hiddenDim)
+    print(f"   DN outputs: {dnHs.shape}")
+    print(f"   Match outputs: {matchHs.shape}")
+    print("   ✓ Split outputs correct")
+    
+    print("\n5. Testing with empty GT...")
+    emptyTargets = []
+    for f in range(numFrames):
+        frameTargets = []
+        for b in range(batchSize):
+            frameTarget = {
+                'labels': torch.tensor([], dtype=torch.long),
+                'boxes': torch.zeros(0, 4),
+                'trackIds': torch.tensor([], dtype=torch.long)
+            }
+            frameTargets.append(frameTarget)
+        emptyTargets.append(frameTargets)
+    
+    dnInfoEmpty = generator(emptyTargets, device)
+    assert dnInfoEmpty is None, "DN should return None for empty GT"
+    print("   ✓ Empty GT handled correctly")
+    
+    print("\n✓ All denoising tests passed!")
+
+
 def main():
     """Run all tests."""
     print("\n" + "=" * 60)
@@ -484,6 +644,7 @@ def main():
         testContrastiveLoss()
         testVideoMatcher()
         testVideoCriterion()
+        testDenoising()
         testVideoDETRModel()
         
         print("\n" + "=" * 60)
