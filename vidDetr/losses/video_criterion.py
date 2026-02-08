@@ -35,6 +35,43 @@ from util.misc import (
 from .contrastive_loss import SupervisedContrastiveLoss
 
 
+def sigmoidFocalLoss(
+    inputs: Tensor, 
+    targets: Tensor, 
+    numBoxes: float,
+    alpha: float = 0.25, 
+    gamma: float = 2.0
+) -> Tensor:
+    """
+    Sigmoid focal loss for classification.
+    
+    Focal loss down-weights well-classified examples and focuses on hard ones.
+    This is crucial for training with extreme class imbalance (many no-object queries).
+    
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    
+    Args:
+        inputs: [B, numQueries, numClasses] raw logits (no sigmoid applied)
+        targets: [B, numQueries, numClasses] one-hot targets
+        numBoxes: normalization factor
+        alpha: balancing factor (default: 0.25)
+        gamma: focusing parameter (default: 2.0)
+    
+    Returns:
+        Scalar focal loss
+    """
+    prob = inputs.sigmoid()
+    ceTarget = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    pT = prob * targets + (1 - prob) * (1 - targets)
+    focalWeight = (1 - pT) ** gamma
+    
+    # Alpha weighting: alpha for positive, (1-alpha) for negative
+    alphaT = alpha * targets + (1 - alpha) * (1 - targets)
+    
+    loss = alphaT * focalWeight * ceTarget
+    return loss.mean(1).sum() / numBoxes
+
+
 class VideoHungarianMatcher(nn.Module):
     """
     Hungarian matcher for video sequences.
@@ -156,7 +193,7 @@ class VideoCriterion(nn.Module):
     Video criterion for VideoDETR training.
     
     Computes losses for:
-    1. Classification (cross-entropy)
+    1. Classification (cross-entropy or focal loss)
     2. Bounding box regression (L1 + GIoU)
     3. Object tracking (supervised contrastive)
     
@@ -164,11 +201,14 @@ class VideoCriterion(nn.Module):
         numClasses: Number of object classes
         matcher: Hungarian matcher module
         weightDict: Dict of loss weights
-        eosCoef: Weight for no-object class
+        eosCoef: Weight for no-object class (used with cross-entropy)
         losses: List of loss names to compute
         numFrames: Number of frames per clip
         queriesPerFrame: Number of queries per frame
         contrastiveTemp: Temperature for contrastive loss
+        useFocalLoss: Use sigmoid focal loss instead of cross-entropy (default: True)
+        focalAlpha: Focal loss alpha parameter (default: 0.25)
+        focalGamma: Focal loss gamma parameter (default: 2.0)
     """
     
     def __init__(
@@ -180,7 +220,10 @@ class VideoCriterion(nn.Module):
         losses: List[str] = None,
         numFrames: int = 5,
         queriesPerFrame: int = 75,
-        contrastiveTemp: float = 0.07
+        contrastiveTemp: float = 0.07,
+        useFocalLoss: bool = True,
+        focalAlpha: float = 0.25,
+        focalGamma: float = 2.0
     ):
         super().__init__()
         
@@ -191,8 +234,11 @@ class VideoCriterion(nn.Module):
         self.losses = losses if losses is not None else ['labels', 'boxes', 'cardinality', 'tracking']
         self.numFrames = numFrames
         self.queriesPerFrame = queriesPerFrame
+        self.useFocalLoss = useFocalLoss
+        self.focalAlpha = focalAlpha
+        self.focalGamma = focalGamma
         
-        # Class weights for cross-entropy (downweight no-object)
+        # Class weights for cross-entropy (downweight no-object) - used when not using focal loss
         emptyWeight = torch.ones(numClasses + 1)
         emptyWeight[-1] = eosCoef
         self.register_buffer('emptyWeight', emptyWeight)
@@ -201,6 +247,11 @@ class VideoCriterion(nn.Module):
         self.contrastiveLoss = SupervisedContrastiveLoss(
             temperature=contrastiveTemp
         )
+        
+        if useFocalLoss:
+            print(f"[VideoCriterion] Using focal loss (alpha={focalAlpha}, gamma={focalGamma})")
+        else:
+            print(f"[VideoCriterion] Using cross-entropy (eos_coef={eosCoef})")
     
     def lossLabels(
         self,
@@ -211,7 +262,7 @@ class VideoCriterion(nn.Module):
         log: bool = True
     ) -> Dict[str, Tensor]:
         """
-        Classification loss (cross-entropy).
+        Classification loss (focal loss or cross-entropy).
         
         Computed per-frame and averaged.
         """
@@ -221,7 +272,7 @@ class VideoCriterion(nn.Module):
         device = srcLogits.device
         batchSize = srcLogits.shape[0]
         
-        # Build target classes tensor
+        # Build target classes tensor [B, numQueries]
         targetClasses = torch.full(
             srcLogits.shape[:2], 
             self.numClasses,  # no-object class
@@ -244,18 +295,29 @@ class VideoCriterion(nn.Module):
                 tgtLabels = targets[frameIdx][batchIdx]['labels'][tgtIdx]
                 targetClasses[batchIdx, globalSrcIdx] = tgtLabels.to(device)
         
-        # Compute cross-entropy loss
-        lossCe = F.cross_entropy(
-            srcLogits.transpose(1, 2),
-            targetClasses,
-            self.emptyWeight.to(device)
-        )
+        if self.useFocalLoss:
+            # Focal loss: operates on one-hot targets with sigmoid
+            # srcLogits shape: [B, numQueries, numClasses+1]
+            # Build one-hot targets of same shape
+            targetClassesOnehot = torch.zeros_like(srcLogits)
+            targetClassesOnehot.scatter_(2, targetClasses.unsqueeze(-1), 1)
+            
+            lossCe = sigmoidFocalLoss(
+                srcLogits, targetClassesOnehot, numBoxes,
+                alpha=self.focalAlpha, gamma=self.focalGamma
+            )
+        else:
+            # Standard cross-entropy with class weighting
+            lossCe = F.cross_entropy(
+                srcLogits.transpose(1, 2),
+                targetClasses,
+                self.emptyWeight.to(device)
+            )
         
         losses = {'loss_ce': lossCe}
         
         if log:
             # Compute classification error for logging
-            # Get indices of all matched predictions
             allSrcIdx = []
             allTgtLabels = []
             
@@ -277,8 +339,17 @@ class VideoCriterion(nn.Module):
                 srcIdxCat = torch.cat([x[1] for x in allSrcIdx])
                 tgtLabelsCat = torch.cat(allTgtLabels).to(device)
                 
-                predLogitsMatched = srcLogits[batchIdxCat, srcIdxCat]
-                losses['class_error'] = 100 - accuracy(predLogitsMatched, tgtLabelsCat)[0]
+                # For focal loss, class_error is computed on matched predictions only
+                if self.useFocalLoss:
+                    # Get the logits of matched queries and compute accuracy
+                    predLogitsMatched = srcLogits[batchIdxCat, srcIdxCat]
+                    # With focal loss, predict = argmax of sigmoid
+                    predClasses = predLogitsMatched.sigmoid().argmax(-1)
+                    correctPreds = (predClasses == tgtLabelsCat).float().mean() * 100
+                    losses['class_error'] = 100 - correctPreds
+                else:
+                    predLogitsMatched = srcLogits[batchIdxCat, srcIdxCat]
+                    losses['class_error'] = 100 - accuracy(predLogitsMatched, tgtLabelsCat)[0]
             else:
                 losses['class_error'] = torch.tensor(0.0, device=device)
         
@@ -620,9 +691,15 @@ def buildVideoCriterion(args) -> VideoCriterion:
         queriesPerFrame=args.queriesPerFrame
     )
     
+    useFocalLoss = getattr(args, 'useFocalLoss', True)
+    
     # Build weight dict
+    # With focal loss, the CE weight needs to be higher since focal loss 
+    # produces smaller values due to the (1-pt)^gamma factor
+    ceLossCoef = 2.0 if useFocalLoss else 1.0
+    
     weightDict = {
-        'loss_ce': 1,
+        'loss_ce': ceLossCoef,
         'loss_bbox': args.bboxLossCoef,
         'loss_giou': args.giouLossCoef,
         'loss_tracking': getattr(args, 'trackingLossCoef', 1.0)
@@ -633,9 +710,10 @@ def buildVideoCriterion(args) -> VideoCriterion:
         auxWeightDict = {}
         for i in range(args.decLayers - 1):
             auxWeightDict.update({k + f'_{i}': v for k, v in weightDict.items()})
-        # Remove tracking from aux (optional, could include it)
+        # Remove tracking from aux (computed only at the last layer)
         auxWeightDict = {k: v for k, v in auxWeightDict.items() if 'tracking' not in k}
         weightDict.update(auxWeightDict)
+        print(f"[buildVideoCriterion] Auxiliary losses enabled for {args.decLayers - 1} decoder layers")
     
     losses = ['labels', 'boxes', 'cardinality', 'tracking']
     
@@ -647,7 +725,12 @@ def buildVideoCriterion(args) -> VideoCriterion:
         losses=losses,
         numFrames=args.numFrames,
         queriesPerFrame=args.queriesPerFrame,
-        contrastiveTemp=getattr(args, 'contrastiveTemp', 0.07)
+        contrastiveTemp=getattr(args, 'contrastiveTemp', 0.07),
+        useFocalLoss=useFocalLoss,
+        focalAlpha=getattr(args, 'focalAlpha', 0.25),
+        focalGamma=getattr(args, 'focalGamma', 2.0)
     )
+    
+    print(f"[buildVideoCriterion] Weight dict keys: {list(weightDict.keys())}")
     
     return criterion

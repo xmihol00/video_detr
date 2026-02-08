@@ -170,6 +170,12 @@ class VideoDETR(nn.Module):
         
         return queries
     
+    def freezeBackbone(self, freeze: bool = True):
+        """Freeze or unfreeze backbone parameters."""
+        print(f"{'Freezing' if freeze else 'Unfreezing'} backbone parameters.")
+        for param in self.backbone.parameters():
+            param.requires_grad = not freeze
+    
     def forward(
         self,
         samples: List[NestedTensor]

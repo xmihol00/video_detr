@@ -34,7 +34,8 @@ def trainOneEpoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     epoch: int,
-    maxNorm: float = 0
+    maxNorm: float = 0,
+    accumSteps: int = 1
 ) -> Dict[str, float]:
     """
     Train for one epoch.
@@ -47,6 +48,7 @@ def trainOneEpoch(
         device: Device for computation
         epoch: Current epoch number
         maxNorm: Maximum gradient norm for clipping (0 to disable)
+        accumSteps: Number of gradient accumulation steps
     
     Returns:
         Dict of average metrics for the epoch
@@ -61,7 +63,9 @@ def trainOneEpoch(
     header = f'Epoch: [{epoch}]'
     printFreq = 10
     
-    for samples, targets in metricLogger.log_every(dataLoader, printFreq, header):
+    optimizer.zero_grad()
+    
+    for batchIdx, (samples, targets) in enumerate(metricLogger.log_every(dataLoader, printFreq, header)):
         # Move samples to device
         # samples is a list of NestedTensors, one per frame
         samples = [sample.to(device) for sample in samples]
@@ -88,7 +92,10 @@ def trainOneEpoch(
             if k in weightDict
         )
         
-        # Reduce losses for logging
+        # Scale loss by accumulation steps
+        losses = losses / accumSteps
+        
+        # Reduce losses for logging (use unscaled values for metrics)
         lossDictReduced = utils.reduce_dict(lossDict)
         lossDictReducedUnscaled = {
             f'{k}_unscaled': v
@@ -108,14 +115,16 @@ def trainOneEpoch(
             print(lossDictReduced)
             sys.exit(1)
         
-        # Backward pass
-        optimizer.zero_grad()
+        # Backward pass (accumulate gradients)
         losses.backward()
         
-        if maxNorm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), maxNorm)
-        
-        optimizer.step()
+        # Step optimizer every accumSteps iterations (or at the end of epoch)
+        if (batchIdx + 1) % accumSteps == 0:
+            if maxNorm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), maxNorm)
+            
+            optimizer.step()
+            optimizer.zero_grad()
         
         # Update metrics
         metricLogger.update(
@@ -129,6 +138,13 @@ def trainOneEpoch(
         # Log tracking loss specifically
         if 'loss_tracking' in lossDictReduced:
             metricLogger.update(loss_tracking=lossDictReduced['loss_tracking'].item())
+    
+    # Flush any remaining accumulated gradients
+    if (batchIdx + 1) % accumSteps != 0:
+        if maxNorm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), maxNorm)
+        optimizer.step()
+        optimizer.zero_grad()
     
     # Gather stats from all processes
     metricLogger.synchronize_between_processes()

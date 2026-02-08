@@ -189,18 +189,18 @@ def testVideoMatcher():
         'pred_boxes': torch.rand(batchSize, numQueries, 4).sigmoid()
     }
     
-    # Create targets: 2 objects per frame
+    # Create targets in frame-first format: targets[frameIdx][batchIdx]
     targets = []
-    for b in range(batchSize):
-        batchTargets = []
-        for f in range(3):
+    for f in range(3):
+        frameTargets = []
+        for b in range(batchSize):
             frameTarget = {
                 'labels': torch.randint(0, numClasses, (2,)),
                 'boxes': torch.rand(2, 4),
                 'trackIds': torch.tensor([0, 1])
             }
-            batchTargets.append(frameTarget)
-        targets.append(batchTargets)
+            frameTargets.append(frameTarget)
+        targets.append(frameTargets)
     
     print("\n1. Testing matching computation...")
     indices = matcher(outputs, targets)
@@ -273,17 +273,18 @@ def testVideoCriterion():
         outputs['pred_tracking'], p=2, dim=-1
     )
     
+    # Create targets in frame-first format: targets[frameIdx][batchIdx]
     targets = []
-    for b in range(batchSize):
-        batchTargets = []
-        for f in range(numFrames):
+    for f in range(numFrames):
+        frameTargets = []
+        for b in range(batchSize):
             frameTarget = {
                 'labels': torch.randint(0, numClasses, (3,)),
                 'boxes': torch.rand(3, 4),
                 'trackIds': torch.tensor([0, 1, 2])
             }
-            batchTargets.append(frameTarget)
-        targets.append(batchTargets)
+            frameTargets.append(frameTarget)
+        targets.append(frameTargets)
     
     print("\n1. Testing full criterion forward pass...")
     losses = criterion(outputs, targets)
@@ -357,6 +358,9 @@ def testVideoDETRModel():
         trackingLossCoef = 1.0
         contrastiveTemp = 0.07
         decLayers = 2
+        useFocalLoss = True
+        focalAlpha = 0.25
+        focalGamma = 2.0
         
         device = 'cpu'
     
@@ -433,18 +437,18 @@ def testVideoDETRModel():
     print("\n3. Testing with criterion...")
     criterion = buildVideoCriterion(args)
     
-    # Create targets
+    # Create targets in frame-first format: targets[frameIdx][batchIdx]
     targets = []
-    for b in range(batchSize):
-        batchTargets = []
-        for f in range(args.numFrames):
+    for f in range(args.numFrames):
+        frameTargets = []
+        for b in range(batchSize):
             frameTarget = {
                 'labels': torch.randint(0, args.numClasses, (2,)),
                 'boxes': torch.rand(2, 4),
                 'trackIds': torch.tensor([0, 1])
             }
-            batchTargets.append(frameTarget)
-        targets.append(batchTargets)
+            frameTargets.append(frameTarget)
+        targets.append(frameTargets)
     
     model.train()
     outputs = model(samples)

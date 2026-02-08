@@ -40,10 +40,12 @@ from vidDetr.models import buildVideoDETR
 from vidDetr.datasets import VideoSequenceDataset, buildVideoDataset, videoCollateFn
 from vidDetr.engine import trainOneEpoch, evaluate
 
+NUM_GPUS = 1
+
 import safe_gpu
 while True:
     try:
-        safe_gpu.claim_gpus(1)
+        safe_gpu.claim_gpus(NUM_GPUS)
         break
     except:
         print("Waiting for free GPU")
@@ -67,7 +69,7 @@ def getArgsParser():
                         help='Base learning rate')
     parser.add_argument('--lrBackbone', default=1e-5, type=float,
                         help='Learning rate for backbone')
-    parser.add_argument('--batchSize', default=2, type=int,
+    parser.add_argument('--batchSize', default=12, type=int,
                         help='Batch size per GPU')
     parser.add_argument('--weightDecay', default=1e-4, type=float,
                         help='Weight decay')
@@ -78,9 +80,21 @@ def getArgsParser():
     parser.add_argument('--clipMaxNorm', default=0.1, type=float,
                         help='Gradient clipping max norm')
     
+    # Warmup parameters
+    parser.add_argument('--warmupEpochs', default=5, type=int,
+                        help='Number of warmup epochs with linearly increasing LR')
+    parser.add_argument('--warmupStartLr', default=1e-6, type=float,
+                        help='Starting learning rate for warmup')
+    
+    # Gradient accumulation
+    parser.add_argument('--accumSteps', default=4, type=int,
+                        help='Gradient accumulation steps (effective batch = batchSize * accumSteps)')
+    
     # Model parameters
     parser.add_argument('--backbone', default='resnet50', type=str,
                         help='CNN backbone architecture')
+    parser.add_argument('--freezeBackbone', action='store_true', default=True,
+                        help='Freeze backbone parameters during training')
     parser.add_argument('--dilation', action='store_true',
                         help='Use dilation in last backbone block')
     parser.add_argument('--positionEmbedding', default='sine', type=str,
@@ -107,9 +121,9 @@ def getArgsParser():
                         help='Use pre-normalization in transformer')
     
     # VideoDETR specific parameters
-    parser.add_argument('--numFrames', default=5, type=int,
+    parser.add_argument('--numFrames', default=4, type=int,
                         help='Number of frames per video clip')
-    parser.add_argument('--queriesPerFrame', default=75, type=int,
+    parser.add_argument('--queriesPerFrame', default=50, type=int,
                         help='Number of detection queries per frame')
     parser.add_argument('--trackingEmbedDim', default=128, type=int,
                         help='Dimension of tracking embeddings')
@@ -117,8 +131,16 @@ def getArgsParser():
                         help='Maximum frames for temporal encoding')
     
     # Loss parameters
-    parser.add_argument('--auxLoss', default=True, type=bool,
+    parser.add_argument('--auxLoss', action='store_true', default=True,
                         help='Use auxiliary losses at each decoder layer')
+    parser.add_argument('--noAuxLoss', dest='auxLoss', action='store_false',
+                        help='Disable auxiliary losses')
+    parser.add_argument('--useFocalLoss', action='store_true', default=True,
+                        help='Use focal loss instead of cross-entropy for classification')
+    parser.add_argument('--focalAlpha', default=0.4, type=float,
+                        help='Focal loss alpha (balancing factor)')
+    parser.add_argument('--focalGamma', default=1.4, type=float,
+                        help='Focal loss gamma (focusing parameter)')
     parser.add_argument('--setCostClass', default=1.0, type=float,
                         help='Classification cost in matching')
     parser.add_argument('--setCostBbox', default=5.0, type=float,
@@ -129,7 +151,7 @@ def getArgsParser():
                         help='L1 box loss coefficient')
     parser.add_argument('--giouLossCoef', default=2.0, type=float,
                         help='GIoU loss coefficient')
-    parser.add_argument('--eosCoef', default=0.1, type=float,
+    parser.add_argument('--eosCoef', default=0.065, type=float,
                         help='No-object class weight')
     parser.add_argument('--trackingLossCoef', default=1.0, type=float,
                         help='Tracking contrastive loss coefficient')
@@ -147,7 +169,7 @@ def getArgsParser():
                         help='Minimum gap between sampled frames')
     parser.add_argument('--maxFrameGap', default=10, type=int,
                         help='Maximum gap between sampled frames')
-    parser.add_argument('--maxSize', default=800, type=int,
+    parser.add_argument('--maxSize', default=480, type=int,
                         help='Maximum image size after transforms')
     
     # Training parameters
@@ -163,11 +185,11 @@ def getArgsParser():
                         help='Starting epoch number')
     parser.add_argument('--eval', action='store_true',
                         help='Run evaluation only')
-    parser.add_argument('--numWorkers', default=4, type=int,
+    parser.add_argument('--numWorkers', default=2, type=int,
                         help='Number of dataloader workers')
     
     # Distributed training
-    parser.add_argument('--worldSize', default=1, type=int,
+    parser.add_argument('--worldSize', default=NUM_GPUS, type=int,
                         help='Number of distributed processes')
     parser.add_argument('--distUrl', default='env://',
                         help='URL for distributed training setup')
@@ -273,7 +295,33 @@ def main(args):
         weight_decay=args.weightDecay
     )
     
-    lrScheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lrDrop)
+    # Learning rate scheduler: warmup + step decay
+    # StepLR handles the main schedule (drop at lrDrop)
+    stepScheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lrDrop)
+    
+    # Warmup scheduler (linear warmup over warmupEpochs)
+    if args.warmupEpochs > 0:
+        # Compute warmup factor: start from warmupStartLr / lr and linearly go to 1.0
+        warmupStartFactor = args.warmupStartLr / args.lr
+        warmupScheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=warmupStartFactor,
+            end_factor=1.0,
+            total_iters=args.warmupEpochs
+        )
+        lrScheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmupScheduler, stepScheduler],
+            milestones=[args.warmupEpochs]
+        )
+    else:
+        lrScheduler = stepScheduler
+    
+    print(f"Optimizer: AdamW, lr={args.lr}, lr_backbone={args.lrBackbone}")
+    print(f"LR schedule: warmup {args.warmupEpochs} epochs ({args.warmupStartLr} -> {args.lr}), "
+          f"step drop at epoch {args.lrDrop}")
+    print(f"Gradient accumulation: {args.accumSteps} steps "
+          f"(effective batch size = {args.batchSize * args.accumSteps})")
     
     # Build datasets
     print("Building datasets...")
@@ -300,7 +348,8 @@ def main(args):
         datasetTrain,
         batch_sampler=batchSamplerTrain,
         collate_fn=videoCollateFn,
-        num_workers=args.numWorkers
+        num_workers=args.numWorkers,
+        prefetch_factor=1
     )
     
     dataLoaderVal = DataLoader(
@@ -309,7 +358,8 @@ def main(args):
         sampler=samplerVal,
         drop_last=False,
         collate_fn=videoCollateFn,
-        num_workers=args.numWorkers
+        num_workers=args.numWorkers,
+        prefetch_factor=1
     )
     
     # Setup output directory
@@ -326,6 +376,11 @@ def main(args):
             k: v for k, v in checkpoint['model'].items()
             if k in modelDict and v.shape == modelDict[k].shape
         }
+        notLoaded = set(modelDict.keys()) - set(pretrainedDict.keys())
+        if notLoaded:
+            print(f"Warning: {len(notLoaded)} parameters not loaded from pretrained weights:")
+            for k in list(notLoaded):  # Print up to 10 missing keys
+                print(f"  {k}")
         modelDict.update(pretrainedDict)
         modelWithoutDdp.load_state_dict(modelDict, strict=False)
         print(f"Loaded {len(pretrainedDict)}/{len(checkpoint['model'])} pretrained weights")
@@ -349,6 +404,9 @@ def main(args):
         )
         print(f"Evaluation results: {testStats}")
         return
+
+    if args.freezeBackbone:
+        model.freezeBackbone(freeze=False)
     
     # Training loop
     print("Starting training...")
@@ -361,7 +419,8 @@ def main(args):
         # Train one epoch
         trainStats = trainOneEpoch(
             model, criterion, dataLoaderTrain,
-            optimizer, device, epoch, args.clipMaxNorm
+            optimizer, device, epoch, args.clipMaxNorm,
+            accumSteps=args.accumSteps
         )
         
         lrScheduler.step()

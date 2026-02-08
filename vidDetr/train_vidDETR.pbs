@@ -1,9 +1,9 @@
 #!/bin/bash
 #PBS -N detr_train
 #PBS -l select=1:ncpus=4:ngpus=1:mem_free=24G:gpu_ram=24G
-#PBS -l walltime=24:00:00
+#PBS -l walltime=168:00:00
 #PBS -j oe
-#PBS -o train_vidDetr.log
+#PBS -o vidDetr_train.log
 
 cd "/homes/eva/xm/xmihol00"
 source setup.sh
