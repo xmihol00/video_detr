@@ -290,7 +290,11 @@ class VideoSequenceDataset(Dataset):
         return sorted(sampledFrames)
     
     def _loadImage(self, seqId: str, frameIdx: int) -> Image.Image:
-        """Load a single image from the dataset."""
+        """Load a single image from the dataset.
+        
+        Eagerly loads pixel data and closes the file handle to avoid
+        leaking file descriptors in multiprocessing workers.
+        """
         imgPath = self.imagesDir / f"seq_{seqId}_frame_{frameIdx:04d}.jpg"
         
         # Try different extensions if .jpg doesn't exist
@@ -301,7 +305,12 @@ class VideoSequenceDataset(Dataset):
                     imgPath = altPath
                     break
         
-        return Image.open(imgPath).convert('RGB')
+        # Open, force pixel decode, then close the file handle.
+        # PIL uses lazy loading by default — the underlying file stays open
+        # until .load() is called. In DataLoader workers this leaks FDs.
+        with Image.open(imgPath) as img:
+            img.load()  # force full decode into memory
+            return img.convert('RGB')
     
     def _loadLabels(
         self, 

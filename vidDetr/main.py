@@ -33,7 +33,13 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.multiprocessing
 from torch.utils.data import DataLoader, DistributedSampler
+
+# Use file_system sharing strategy to avoid running out of file descriptors.
+# The default 'file_descriptor' strategy uses one FD per shared tensor, which
+# quickly exhausts the 1024 FD limit on shared machines with video batches.
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 import util.misc as utils
 from vidDetr.models import buildVideoDETR
@@ -69,7 +75,7 @@ def getArgsParser():
                         help='Base learning rate')
     parser.add_argument('--lrBackbone', default=1e-5, type=float,
                         help='Learning rate for backbone')
-    parser.add_argument('--batchSize', default=7, type=int,
+    parser.add_argument('--batchSize', default=26, type=int,
                         help='Batch size per GPU')
     parser.add_argument('--weightDecay', default=1e-4, type=float,
                         help='Weight decay')
@@ -135,31 +141,31 @@ def getArgsParser():
                         help='Use auxiliary losses at each decoder layer')
     parser.add_argument('--noAuxLoss', dest='auxLoss', action='store_false',
                         help='Disable auxiliary losses')
-    parser.add_argument('--useFocalLoss', action='store_true', default=True,
+    parser.add_argument('--useFocalLoss', action='store_true', default=False,
                         help='Use focal loss instead of cross-entropy for classification')
     parser.add_argument('--focalAlpha', default=0.4, type=float,
                         help='Focal loss alpha (balancing factor)')
     parser.add_argument('--focalGamma', default=1.4, type=float,
                         help='Focal loss gamma (focusing parameter)')
-    parser.add_argument('--setCostClass', default=1.0, type=float,
+    parser.add_argument('--setCostClass', default=2.0, type=float,
                         help='Classification cost in matching')
-    parser.add_argument('--setCostBbox', default=5.0, type=float,
+    parser.add_argument('--setCostBbox', default=4.0, type=float,
                         help='L1 box cost in matching')
     parser.add_argument('--setCostGiou', default=2.0, type=float,
                         help='GIoU cost in matching')
-    parser.add_argument('--bboxLossCoef', default=5.0, type=float,
+    parser.add_argument('--bboxLossCoef', default=4.0, type=float,
                         help='L1 box loss coefficient')
     parser.add_argument('--giouLossCoef', default=2.0, type=float,
                         help='GIoU loss coefficient')
-    parser.add_argument('--eosCoef', default=0.065, type=float,
+    parser.add_argument('--eosCoef', default=0.08, type=float,
                         help='No-object class weight')
-    parser.add_argument('--trackingLossCoef', default=1.0, type=float,
+    parser.add_argument('--trackingLossCoef', default=2.0, type=float,
                         help='Tracking contrastive loss coefficient')
     parser.add_argument('--contrastiveTemp', default=0.07, type=float,
                         help='Temperature for contrastive loss')
     
     # Label denoising (DN-DETR / DINO) parameters
-    parser.add_argument('--useDnDenoising', action='store_true', default=True,
+    parser.add_argument('--useDnDenoising', action='store_true', default=False,
                         help='Use label denoising for training stabilization')
     parser.add_argument('--noDnDenoising', dest='useDnDenoising', action='store_false',
                         help='Disable label denoising')
@@ -183,7 +189,7 @@ def getArgsParser():
                         help='Minimum gap between sampled frames')
     parser.add_argument('--maxFrameGap', default=10, type=int,
                         help='Maximum gap between sampled frames')
-    parser.add_argument('--maxSize', default=512, type=int,
+    parser.add_argument('--maxSize', default=384, type=int,
                         help='Maximum image size after transforms')
     
     # Training parameters
@@ -209,7 +215,7 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    parser.add_argument('--pretrainedDetr', default='detr-r50-e632da11.pth', type=str,
+    parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/vidDetr_weights_1/video_detr_best.pth', type=str,
                         help='Path to pretrained DETR weights')
     
     return parser
@@ -363,7 +369,9 @@ def main(args):
         batch_sampler=batchSamplerTrain,
         collate_fn=videoCollateFn,
         num_workers=args.numWorkers,
-        prefetch_factor=1
+        prefetch_factor=2 if args.numWorkers > 0 else None,
+        persistent_workers=args.numWorkers > 0,
+        pin_memory=True
     )
     
     dataLoaderVal = DataLoader(
@@ -373,7 +381,9 @@ def main(args):
         drop_last=False,
         collate_fn=videoCollateFn,
         num_workers=args.numWorkers,
-        prefetch_factor=1
+        prefetch_factor=2 if args.numWorkers > 0 else None,
+        persistent_workers=args.numWorkers > 0,
+        pin_memory=True
     )
     
     # Setup output directory
@@ -400,6 +410,7 @@ def main(args):
         print(f"Loaded {len(pretrainedDict)}/{len(checkpoint['model'])} pretrained weights")
     
     # Resume from checkpoint
+    bestMetric = float('inf')  # Initialize best metric tracker
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location='cpu')
@@ -409,6 +420,10 @@ def main(args):
             optimizer.load_state_dict(checkpoint['optimizer'])
             lrScheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.startEpoch = checkpoint['epoch'] + 1
+            # Restore best metric if available
+            if 'best_metric' in checkpoint:
+                bestMetric = checkpoint['best_metric']
+                print(f"Restored best metric: {bestMetric:.4f}")
     
     # Evaluation only
     if args.eval:
@@ -425,6 +440,7 @@ def main(args):
     # Training loop
     print("Starting training...")
     startTime = time.time()
+    # bestMetric already initialized above (either from checkpoint or float('inf'))
     
     for epoch in range(args.startEpoch, args.epochs):
         if args.distributed:
@@ -439,35 +455,54 @@ def main(args):
         
         lrScheduler.step()
         
-        # Save checkpoint
-        if args.outputDir:
-            checkpointPaths = [outputDir / 'checkpoint.pth']
-            
-            # Extra checkpoints at LR drop and periodically
-            if (epoch + 1) % args.lrDrop == 0 or (epoch + 1) % 10 == 0:
-                checkpointPaths.append(outputDir / f'checkpoint{epoch:04d}.pth')
-            
-            for checkpointPath in checkpointPaths:
-                utils.save_on_master({
-                    'model': modelWithoutDdp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lrScheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpointPath)
-        
         # Evaluate
         testStats = evaluate(
             model, criterion, postprocessors,
             dataLoaderVal, device, args.outputDir
         )
         
+        # Save checkpoint after every epoch
+        if args.outputDir:
+            checkpointPaths = []
+            
+            # 1. Save every epoch with unique name (video_detr_XXX.pth format)
+            epochCheckpoint = outputDir / f'video_detr_{epoch+1:03d}.pth'
+            checkpointPaths.append(epochCheckpoint)
+            
+            # 2. Always update the latest checkpoint
+            latestCheckpoint = outputDir / 'checkpoint_latest.pth'
+            checkpointPaths.append(latestCheckpoint)
+            
+            # 3. Check if this is the best model so far (lowest validation loss)
+            currentMetric = testStats.get('loss', float('inf'))
+            if currentMetric < bestMetric:
+                bestMetric = currentMetric
+                bestCheckpoint = outputDir / 'video_detr_best.pth'
+                checkpointPaths.append(bestCheckpoint)
+                print(f"*** New best model at epoch {epoch+1} with loss={currentMetric:.4f} ***")
+            
+            # Save all checkpoint paths
+            checkpoint_data = {
+                'model': modelWithoutDdp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lrScheduler.state_dict(),
+                'epoch': epoch,
+                'best_metric': bestMetric,
+                'args': args,
+            }
+            
+            for checkpointPath in checkpointPaths:
+                utils.save_on_master(checkpoint_data, checkpointPath)
+            
+            print(f"Checkpoints saved: {[p.name for p in checkpointPaths]}")
+        
         # Log stats
         logStats = {
             **{f'train_{k}': v for k, v in trainStats.items()},
             **{f'test_{k}': v for k, v in testStats.items()},
             'epoch': epoch,
-            'n_parameters': nParameters
+            'n_parameters': nParameters,
+            'best_metric': bestMetric
         }
         
         if args.outputDir and utils.is_main_process():

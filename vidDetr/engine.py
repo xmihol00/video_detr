@@ -58,8 +58,8 @@ def trainOneEpoch(
     
     metricLogger = utils.MetricLogger(delimiter="  ")
     metricLogger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    metricLogger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
-    metricLogger.add_meter('loss_tracking', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metricLogger.add_meter('class_error', utils.SmoothedValue(window_size=10, fmt='{value:.2f}'))
+    metricLogger.add_meter('loss_tracking', utils.SmoothedValue(window_size=10, fmt='{value:.4f}'))
     header = f'Epoch: [{epoch}]'
     printFreq = 10
     

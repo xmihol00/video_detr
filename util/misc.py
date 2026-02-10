@@ -179,7 +179,7 @@ class MetricLogger(object):
     def __str__(self):
         loss_str = []
         for name, meter in self.meters.items():
-            if name in ["lr", "class_error", "loss", "loss_ce", "loss_bbox"]:
+            if name in ["lr", "class_error", "loss", "loss_ce", "loss_bbox", "loss_tracking"]:
                 loss_str.append(
                     "{}: {}".format(name, str(meter))
                 )
