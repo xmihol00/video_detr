@@ -147,7 +147,7 @@ def getArgsParser():
                         help='Focal loss alpha (balancing factor)')
     parser.add_argument('--focalGamma', default=1.4, type=float,
                         help='Focal loss gamma (focusing parameter)')
-    parser.add_argument('--setCostClass', default=2.0, type=float,
+    parser.add_argument('--setCostClass', default=3.0, type=float,
                         help='Classification cost in matching')
     parser.add_argument('--setCostBbox', default=4.0, type=float,
                         help='L1 box cost in matching')
@@ -215,7 +215,7 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/vidDetr_weights_1/video_detr_best.pth', type=str,
+    parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
                         help='Path to pretrained DETR weights')
     
     return parser

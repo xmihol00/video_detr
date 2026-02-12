@@ -224,8 +224,7 @@ def loadGtLabels(
                 if len(parts) < 5:
                     continue
                 classId = int(parts[0])
-                y1, x1, y2, x2 = map(float, parts[1:5])
-                cx, cy, w, h = x1, y1, x2 - x1, y2 - y1
+                cx, cy, w, h = map(float, parts[1:5])
                 boxes.append([cx, cy, w, h])
                 labels.append(classId)
                 trackIds.append(lineIdx)
