@@ -44,6 +44,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 import util.misc as utils
 from vidDetr.models import buildVideoDETR
 from vidDetr.datasets import VideoSequenceDataset, buildVideoDataset, videoCollateFn
+from vidDetr.datasets import TaoDataset, buildTaoDataset, taoCollateFn
 from vidDetr.engine import trainOneEpoch, evaluate
 
 NUM_GPUS = 1
@@ -157,7 +158,7 @@ def getArgsParser():
                         help='L1 box loss coefficient')
     parser.add_argument('--giouLossCoef', default=2.0, type=float,
                         help='GIoU loss coefficient')
-    parser.add_argument('--eosCoef', default=0.08, type=float,
+    parser.add_argument('--eosCoef', default=0.01, type=float,
                         help='No-object class weight')
     parser.add_argument('--trackingLossCoef', default=2.0, type=float,
                         help='Tracking contrastive loss coefficient')
@@ -192,6 +193,14 @@ def getArgsParser():
     parser.add_argument('--maxSize', default=384, type=int,
                         help='Maximum image size after transforms')
     
+    # TAO dataset parameters
+    parser.add_argument('--taoDataRoot', default='/mnt/matylda5/xmihol00/tao/dataset/', type=str,
+                        help='Root directory of TAO dataset (overrides --dataConfig)')
+    parser.add_argument('--taoMaxCategories', default=None, type=int,
+                        help='Keep only top-N most frequent TAO categories (None=all)')
+    parser.add_argument('--taoWindowOverlap', default=0.5, type=float,
+                        help='Overlap fraction between TAO video windows (0-1)')
+    
     # Training parameters
     parser.add_argument('--outputDir', default='vidDetr_weights/',
                         help='Directory to save checkpoints')
@@ -215,7 +224,7 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
+    parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/vidDetr_weights_1/video_detr_best.pth', type=str,
                         help='Path to pretrained DETR weights')
     
     return parser
@@ -273,6 +282,18 @@ def main(args):
     # Convert args for compatibility
     args = convertArgsForBackbone(args)
     args = convertArgsForTransformer(args)
+    
+    # Build datasets FIRST so that dataset-driven numClasses is set
+    # before the model and criterion are constructed.
+    print("Building datasets...")
+    if args.taoDataRoot:
+        datasetTrain, datasetVal = buildTaoDataset(args)
+        collateFn = taoCollateFn
+    else:
+        datasetTrain, datasetVal = buildVideoDataset(args)
+        collateFn = videoCollateFn
+    print(f"Train dataset: {len(datasetTrain)} sequences")
+    print(f"Val dataset: {len(datasetVal)} sequences")
     
     # Build model, criterion, and postprocessors
     model, criterion, postprocessors = buildVideoDETR(args)
@@ -343,12 +364,6 @@ def main(args):
     print(f"Gradient accumulation: {args.accumSteps} steps "
           f"(effective batch size = {args.batchSize * args.accumSteps})")
     
-    # Build datasets
-    print("Building datasets...")
-    datasetTrain, datasetVal = buildVideoDataset(args)
-    print(f"Train dataset: {len(datasetTrain)} sequences")
-    print(f"Val dataset: {len(datasetVal)} sequences")
-    
     # Setup samplers
     if args.distributed:
         samplerTrain = DistributedSampler(datasetTrain)
@@ -367,7 +382,7 @@ def main(args):
     dataLoaderTrain = DataLoader(
         datasetTrain,
         batch_sampler=batchSamplerTrain,
-        collate_fn=videoCollateFn,
+        collate_fn=collateFn,
         num_workers=args.numWorkers,
         prefetch_factor=2 if args.numWorkers > 0 else None,
         persistent_workers=args.numWorkers > 0,
@@ -379,7 +394,7 @@ def main(args):
         args.batchSize,
         sampler=samplerVal,
         drop_last=False,
-        collate_fn=videoCollateFn,
+        collate_fn=collateFn,
         num_workers=args.numWorkers,
         prefetch_factor=2 if args.numWorkers > 0 else None,
         persistent_workers=args.numWorkers > 0,

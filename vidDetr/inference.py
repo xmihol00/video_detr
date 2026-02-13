@@ -87,7 +87,7 @@ def getArgsParser() -> argparse.ArgumentParser:
     # Inference behaviour
     parser.add_argument(
         "--confidence",
-        default=0.25,
+        default=0.4,
         type=float,
         help="Minimum confidence threshold for displaying predictions",
     )
@@ -99,7 +99,7 @@ def getArgsParser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--trackingThreshold",
-        default=0.25,
+        default=0.4,
         type=float,
         help="Cosine-similarity threshold for cross-frame track association",
     )
@@ -779,7 +779,7 @@ def main():
         print(f"[Inference] Saving annotated frames to {saveDir}")
 
     # ---- Interactive visualisation loop ----
-    seqIdx = 0
+    seqIdx = 1
 
     while 0 <= seqIdx < len(seqIds):
         seqId = seqIds[seqIdx]
