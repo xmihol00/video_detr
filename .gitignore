@@ -18,3 +18,4 @@ not_tracked_dir/
 vidDetr/test
 test/
 tao_dataset_evaluation
+gt_vs_pred/

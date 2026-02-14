@@ -76,7 +76,7 @@ def getArgsParser():
                         help='Base learning rate')
     parser.add_argument('--lrBackbone', default=1e-5, type=float,
                         help='Learning rate for backbone')
-    parser.add_argument('--batchSize', default=26, type=int,
+    parser.add_argument('--batchSize', default=32, type=int,
                         help='Batch size per GPU')
     parser.add_argument('--weightDecay', default=1e-4, type=float,
                         help='Weight decay')
@@ -100,7 +100,7 @@ def getArgsParser():
     # Model parameters
     parser.add_argument('--backbone', default='resnet50', type=str,
                         help='CNN backbone architecture')
-    parser.add_argument('--freezeBackbone', action='store_true', default=True,
+    parser.add_argument('--freezeBackbone', action='store_true', default=False,
                         help='Freeze backbone parameters during training')
     parser.add_argument('--dilation', action='store_true',
                         help='Use dilation in last backbone block')
@@ -158,7 +158,7 @@ def getArgsParser():
                         help='L1 box loss coefficient')
     parser.add_argument('--giouLossCoef', default=2.0, type=float,
                         help='GIoU loss coefficient')
-    parser.add_argument('--eosCoef', default=0.01, type=float,
+    parser.add_argument('--eosCoef', default=0.05, type=float,
                         help='No-object class weight')
     parser.add_argument('--trackingLossCoef', default=2.0, type=float,
                         help='Tracking contrastive loss coefficient')
@@ -224,7 +224,7 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/vidDetr_weights_1/video_detr_best.pth', type=str,
+    parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/tao_weights_2/video_detr_best.pth', type=str,
                         help='Path to pretrained DETR weights')
     
     return parser
