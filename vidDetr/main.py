@@ -130,7 +130,7 @@ def getArgsParser():
     # VideoDETR specific parameters
     parser.add_argument('--numFrames', default=4, type=int,
                         help='Number of frames per video clip')
-    parser.add_argument('--queriesPerFrame', default=30, type=int,
+    parser.add_argument('--queriesPerFrame', default=50, type=int,
                         help='Number of detection queries per frame')
     parser.add_argument('--trackingEmbedDim', default=128, type=int,
                         help='Dimension of tracking embeddings')
@@ -160,7 +160,7 @@ def getArgsParser():
                         help='L1 box loss coefficient')
     parser.add_argument('--giouLossCoef', default=2.0, type=float,
                         help='GIoU loss coefficient')
-    parser.add_argument('--eosCoef', default=0.02, type=float,
+    parser.add_argument('--eosCoef', default=0.05, type=float,
                         help='No-object class weight (higher = fewer false positives)')
     parser.add_argument('--trackingLossCoef', default=2.0, type=float,
                         help='Tracking contrastive loss coefficient')
@@ -182,7 +182,7 @@ def getArgsParser():
                         help='Coefficient for denoising losses (multiplied with base loss coefs)')
     
     # Duplicate suppression loss
-    parser.add_argument('--dupLossCoef', default=0.5, type=float,
+    parser.add_argument('--dupLossCoef', default=0.65, type=float,
                         help='Weight for IoU-based duplicate suppression loss')
     
     # EMA (Exponential Moving Average)
@@ -212,7 +212,8 @@ def getArgsParser():
                         help='Maximum image size after transforms')
     
     # TAO dataset parameters
-    parser.add_argument('--taoDataRoot', default='/mnt/matylda5/xmihol00/tao/dataset/', type=str,
+    parser.add_argument('--taoDataRoot', default=None, #'/mnt/matylda5/xmihol00/tao/dataset/', 
+                        type=str,
                         help='Root directory of TAO dataset (overrides --dataConfig)')
     parser.add_argument('--taoMaxCategories', default=None, type=int,
                         help='Keep only top-N most frequent TAO categories (None=all)')
@@ -229,7 +230,7 @@ def getArgsParser():
                         help='Directory to save checkpoints')
     parser.add_argument('--device', default='cuda',
                         help='Device for training')
-    parser.add_argument('--seed', default=42, type=int,
+    parser.add_argument('--seed', default=1, type=int,
                         help='Random seed')
     parser.add_argument('--resume', default='', type=str,
                         help='Path to checkpoint to resume from')
@@ -560,7 +561,7 @@ def main(args):
             
             # 1. Save every epoch with unique name (video_detr_XXX.pth format)
             epochCheckpoint = outputDir / f'video_detr_{epoch+1:03d}.pth'
-            checkpointPaths.append(epochCheckpoint)
+            #checkpointPaths.append(epochCheckpoint)
             
             # 2. Always update the latest checkpoint
             latestCheckpoint = outputDir / 'checkpoint_latest.pth'

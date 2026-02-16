@@ -193,6 +193,7 @@ class MetricTracker:
 
     @staticmethod
     def _appendCsv(path: str, row: Dict[str, Any], headerWritten: bool) -> None:
+        return # TODO remove this line when ready to write CSVs
         """Append a single row to a CSV file, writing the header if needed."""
         fileExists = os.path.exists(path)
         mode = "a" if fileExists else "w"

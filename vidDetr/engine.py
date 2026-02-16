@@ -132,7 +132,8 @@ def trainOneEpoch(
         tracker.epochStart(epoch)
 
     totalBatches = len(dataLoader)
-    logInterval = max(totalBatches // 10, 1)  # ~10 log lines per epoch
+    logLines = 10 if totalBatches <= 100 else 20 if totalBatches <= 1000 else 40 if totalBatches <= 3500 else 80 
+    logInterval = max(totalBatches // logLines, 1)  # ~20 log lines per epoch
 
     optimizer.zero_grad()
     batchIdx = -1  # in case dataLoader is empty
