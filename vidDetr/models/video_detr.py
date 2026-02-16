@@ -42,17 +42,26 @@ class MLP(nn.Module):
     Used for bounding box regression head.
     """
     
-    def __init__(self, inputDim: int, hiddenDim: int, outputDim: int, numLayers: int):
+    def __init__(self, inputDim: int, hiddenDim: int, outputDim: int, numLayers: int, dropout: float = 0.0):
         super().__init__()
         self.numLayers = numLayers
+        self.dropout = dropout
         h = [hiddenDim] * (numLayers - 1)
         self.layers = nn.ModuleList(
             nn.Linear(n, k) for n, k in zip([inputDim] + h, h + [outputDim])
         )
+        if dropout > 0:
+            self.dropouts = nn.ModuleList(
+                nn.Dropout(dropout) for _ in range(numLayers - 1)
+            )
+        else:
+            self.dropouts = None
     
     def forward(self, x: Tensor) -> Tensor:
         for i, layer in enumerate(self.layers):
             x = F.relu(layer(x)) if i < self.numLayers - 1 else layer(x)
+            if self.dropouts is not None and i < self.numLayers - 1:
+                x = self.dropouts[i](x)
         return x
 
 
@@ -92,6 +101,8 @@ class VideoDETR(nn.Module):
         auxLoss: bool = True,
         trackingEmbedDim: int = 128,
         temporalType: str = 'learned',
+        # Regularization
+        headDropout: float = 0.0,
         # Label denoising params
         useDnDenoising: bool = True,
         numDnGroups: int = 5,
@@ -106,6 +117,7 @@ class VideoDETR(nn.Module):
         self.auxLoss = auxLoss
         self.numClasses = numClasses
         self.useDnDenoising = useDnDenoising
+        self.headDropout = headDropout
         
         # Core components
         self.backbone = backbone
@@ -132,9 +144,12 @@ class VideoDETR(nn.Module):
         # Frame-specific query embeddings (added to base query embeddings)
         self.frameQueryEmbed = nn.Embedding(numFrames, hiddenDim)
         
-        # Detection heads (same as DETR)
+        # Detection heads (same as DETR, with dropout for regularization)
         self.classEmbed = nn.Linear(hiddenDim, numClasses + 1)  # +1 for no-object
-        self.bboxEmbed = MLP(hiddenDim, hiddenDim, 4, 3)
+        self.bboxEmbed = MLP(hiddenDim, hiddenDim, 4, 3, dropout=headDropout)
+        
+        # Dropout before detection heads (applied to decoder output)
+        self.headDropoutLayer = nn.Dropout(headDropout) if headDropout > 0 else nn.Identity()
         
         # Tracking head for cross-frame association
         self.trackingHead = TrackingHead(
@@ -142,6 +157,7 @@ class VideoDETR(nn.Module):
             hiddenDim=hiddenDim,
             outputDim=trackingEmbedDim,
             numLayers=3,
+            dropout=headDropout,
             normalize=True
         )
         
@@ -337,9 +353,10 @@ class VideoDETR(nn.Module):
             dnMeta = None
             matchHs = hs
         
-        # Compute matching outputs (same as before)
-        outputsClass = self.classEmbed(matchHs)  # [numLayers, B, numQueries, numClasses+1]
-        outputsCoord = self.bboxEmbed(matchHs).sigmoid()  # [numLayers, B, numQueries, 4]
+        # Compute matching outputs (with head dropout for regularization)
+        matchHsDropped = self.headDropoutLayer(matchHs)
+        outputsClass = self.classEmbed(matchHsDropped)  # [numLayers, B, numQueries, numClasses+1]
+        outputsCoord = self.bboxEmbed(matchHsDropped).sigmoid()  # [numLayers, B, numQueries, 4]
         outputsTracking = self.trackingHead(matchHs)  # [numLayers, B, numQueries, trackingDim]
         
         # Build output dict (using last decoder layer)
@@ -358,8 +375,9 @@ class VideoDETR(nn.Module):
         # ---- Add denoising outputs (training only) ----
         if dnMeta is not None:
             # Apply same detection heads to DN outputs
-            dnOutputsClass = self.classEmbed(dnHs)  # [numLayers, B, dnQueries, numClasses+1]
-            dnOutputsCoord = self.bboxEmbed(dnHs).sigmoid()  # [numLayers, B, dnQueries, 4]
+            dnHsDropped = self.headDropoutLayer(dnHs)
+            dnOutputsClass = self.classEmbed(dnHsDropped)  # [numLayers, B, dnQueries, numClasses+1]
+            dnOutputsCoord = self.bboxEmbed(dnHsDropped).sigmoid()  # [numLayers, B, dnQueries, 4]
             
             out['dn_pred_logits'] = dnOutputsClass[-1]
             out['dn_pred_boxes'] = dnOutputsCoord[-1]
@@ -460,6 +478,7 @@ def buildVideoDETR(args) -> Tuple[VideoDETR, nn.Module, Dict[str, nn.Module]]:
         auxLoss=args.auxLoss,
         trackingEmbedDim=getattr(args, 'trackingEmbedDim', 128),
         temporalType=getattr(args, 'temporalEncoding', 'learned'),
+        headDropout=getattr(args, 'dropout', 0.1),
         useDnDenoising=getattr(args, 'useDnDenoising', True),
         numDnGroups=getattr(args, 'numDnGroups', 5),
         labelNoiseRatio=getattr(args, 'labelNoiseRatio', 0.5),

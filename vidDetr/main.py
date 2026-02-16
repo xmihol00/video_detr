@@ -26,10 +26,9 @@ if str(_parentDir) not in sys.path:
 
 import argparse
 import datetime
-import json
 import random
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -45,7 +44,8 @@ import util.misc as utils
 from vidDetr.models import buildVideoDETR
 from vidDetr.datasets import VideoSequenceDataset, buildVideoDataset, videoCollateFn
 from vidDetr.datasets import TaoDataset, buildTaoDataset, taoCollateFn
-from vidDetr.engine import trainOneEpoch, evaluate
+from vidDetr.engine import trainOneEpoch, evaluate, ModelEMA
+from vidDetr.logging_utils import setupLogging, MetricTracker
 
 NUM_GPUS = 1
 
@@ -88,7 +88,7 @@ def getArgsParser():
                         help='Gradient clipping max norm')
     
     # Warmup parameters
-    parser.add_argument('--warmupEpochs', default=5, type=int,
+    parser.add_argument('--warmupEpochs', default=0, type=int,
                         help='Number of warmup epochs with linearly increasing LR')
     parser.add_argument('--warmupStartLr', default=1e-6, type=float,
                         help='Starting learning rate for warmup')
@@ -120,8 +120,8 @@ def getArgsParser():
                         help='Feedforward dimension in transformer')
     parser.add_argument('--hiddenDim', default=256, type=int,
                         help='Transformer hidden dimension')
-    parser.add_argument('--dropout', default=0.1, type=float,
-                        help='Dropout rate')
+    parser.add_argument('--dropout', default=0.2, type=float,
+                        help='Dropout rate in transformer and heads')
     parser.add_argument('--nheads', default=8, type=int,
                         help='Number of attention heads')
     parser.add_argument('--preNorm', action='store_true',
@@ -130,7 +130,7 @@ def getArgsParser():
     # VideoDETR specific parameters
     parser.add_argument('--numFrames', default=4, type=int,
                         help='Number of frames per video clip')
-    parser.add_argument('--queriesPerFrame', default=50, type=int,
+    parser.add_argument('--queriesPerFrame', default=30, type=int,
                         help='Number of detection queries per frame')
     parser.add_argument('--trackingEmbedDim', default=128, type=int,
                         help='Dimension of tracking embeddings')
@@ -144,22 +144,24 @@ def getArgsParser():
                         help='Disable auxiliary losses')
     parser.add_argument('--useFocalLoss', action='store_true', default=False,
                         help='Use focal loss instead of cross-entropy for classification')
-    parser.add_argument('--focalAlpha', default=0.4, type=float,
+    parser.add_argument('--noFocalLoss', dest='useFocalLoss', action='store_false',
+                        help='Disable focal loss, use cross-entropy instead')
+    parser.add_argument('--focalAlpha', default=0.25, type=float,
                         help='Focal loss alpha (balancing factor)')
-    parser.add_argument('--focalGamma', default=1.4, type=float,
+    parser.add_argument('--focalGamma', default=2.0, type=float,
                         help='Focal loss gamma (focusing parameter)')
     parser.add_argument('--setCostClass', default=3.0, type=float,
                         help='Classification cost in matching')
-    parser.add_argument('--setCostBbox', default=4.0, type=float,
+    parser.add_argument('--setCostBbox', default=5.0, type=float,
                         help='L1 box cost in matching')
     parser.add_argument('--setCostGiou', default=2.0, type=float,
                         help='GIoU cost in matching')
-    parser.add_argument('--bboxLossCoef', default=4.0, type=float,
+    parser.add_argument('--bboxLossCoef', default=5.0, type=float,
                         help='L1 box loss coefficient')
     parser.add_argument('--giouLossCoef', default=2.0, type=float,
                         help='GIoU loss coefficient')
-    parser.add_argument('--eosCoef', default=0.05, type=float,
-                        help='No-object class weight')
+    parser.add_argument('--eosCoef', default=0.02, type=float,
+                        help='No-object class weight (higher = fewer false positives)')
     parser.add_argument('--trackingLossCoef', default=2.0, type=float,
                         help='Tracking contrastive loss coefficient')
     parser.add_argument('--contrastiveTemp', default=0.07, type=float,
@@ -178,6 +180,22 @@ def getArgsParser():
                         help='Scale of box coordinate noise (fraction of box size)')
     parser.add_argument('--dnLossCoef', default=1.0, type=float,
                         help='Coefficient for denoising losses (multiplied with base loss coefs)')
+    
+    # Duplicate suppression loss
+    parser.add_argument('--dupLossCoef', default=0.5, type=float,
+                        help='Weight for IoU-based duplicate suppression loss')
+    
+    # EMA (Exponential Moving Average)
+    parser.add_argument('--useEma', action='store_true', default=True,
+                        help='Use EMA (exponential moving average) of model weights')
+    parser.add_argument('--noEma', dest='useEma', action='store_false',
+                        help='Disable EMA')
+    parser.add_argument('--emaDecay', default=0.9997, type=float,
+                        help='EMA decay rate')
+    
+    # Drop path (stochastic depth)
+    parser.add_argument('--dropPathRate', default=0.1, type=float,
+                        help='Drop path rate for stochastic depth regularization')
     
     # Dataset parameters
     parser.add_argument('--dataConfig', default='vidDetr/data.yaml', type=str,
@@ -200,6 +218,11 @@ def getArgsParser():
                         help='Keep only top-N most frequent TAO categories (None=all)')
     parser.add_argument('--taoWindowOverlap', default=0.5, type=float,
                         help='Overlap fraction between TAO video windows (0-1)')
+    
+    # Merge train + val
+    parser.add_argument('--mergeTrainVal', action='store_true', default=True,
+                        help='Merge training and validation sets into one training set '
+                             '(no validation loop; a checkpoint is saved every epoch)')
     
     # Training parameters
     parser.add_argument('--outputDir', default='vidDetr_weights/',
@@ -224,8 +247,10 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/tao_weights_2/video_detr_best.pth', type=str,
-                        help='Path to pretrained DETR weights')
+    #parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/vidDetr_weights/video_detr_003.pth', type=str,
+    #                    help='Path to pretrained DETR weights')
+    parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
+                    help='Path to pretrained DETR weights')
     
     return parser
 
@@ -268,8 +293,19 @@ def main(args):
     """
     # Initialize distributed mode
     utils.init_distributed_mode(args)
-    print(f"git:\n  {utils.get_sha()}\n")
-    print(args)
+
+    # Set up structured logging (file + console)
+    rank = utils.get_rank()
+    distributed = getattr(args, 'distributed', False)
+    vidDetrLogger = setupLogging(
+        outputDir=args.outputDir,
+        logFilename="training.log",
+        distributed=distributed,
+        rank=rank,
+    )
+
+    vidDetrLogger.info("git: %s", utils.get_sha())
+    vidDetrLogger.info("args: %s", args)
     
     device = torch.device(args.device)
     
@@ -285,15 +321,19 @@ def main(args):
     
     # Build datasets FIRST so that dataset-driven numClasses is set
     # before the model and criterion are constructed.
-    print("Building datasets...")
+    mergeTrainVal = getattr(args, 'mergeTrainVal', False)
+    vidDetrLogger.info("Building datasets...")
     if args.taoDataRoot:
         datasetTrain, datasetVal = buildTaoDataset(args)
         collateFn = taoCollateFn
     else:
         datasetTrain, datasetVal = buildVideoDataset(args)
         collateFn = videoCollateFn
-    print(f"Train dataset: {len(datasetTrain)} sequences")
-    print(f"Val dataset: {len(datasetVal)} sequences")
+    vidDetrLogger.info("Train dataset: %d sequences", len(datasetTrain))
+    if datasetVal is not None:
+        vidDetrLogger.info("Val dataset: %d sequences", len(datasetVal))
+    else:
+        vidDetrLogger.info("Val dataset: None (merged into training set)")
     
     # Build model, criterion, and postprocessors
     model, criterion, postprocessors = buildVideoDETR(args)
@@ -311,7 +351,15 @@ def main(args):
     
     # Count parameters
     nParameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'Number of trainable parameters: {nParameters:,}')
+    vidDetrLogger.info('Number of trainable parameters: %s', f'{nParameters:,}')
+    
+    # Setup EMA (Exponential Moving Average)
+    emaModel = None
+    if getattr(args, 'useEma', True):
+        emaModel = ModelEMA(modelWithoutDdp, decay=getattr(args, 'emaDecay', 0.9997))
+        vidDetrLogger.info(
+            "EMA enabled with decay=%.5f", getattr(args, 'emaDecay', 0.9997)
+        )
     
     # Setup optimizer with different learning rates
     paramDicts = [
@@ -358,19 +406,21 @@ def main(args):
     else:
         lrScheduler = stepScheduler
     
-    print(f"Optimizer: AdamW, lr={args.lr}, lr_backbone={args.lrBackbone}")
-    print(f"LR schedule: warmup {args.warmupEpochs} epochs ({args.warmupStartLr} -> {args.lr}), "
-          f"step drop at epoch {args.lrDrop}")
-    print(f"Gradient accumulation: {args.accumSteps} steps "
-          f"(effective batch size = {args.batchSize * args.accumSteps})")
+    vidDetrLogger.info("Optimizer: AdamW, lr=%s, lr_backbone=%s", args.lr, args.lrBackbone)
+    vidDetrLogger.info(
+        "LR schedule: warmup %d epochs (%s -> %s), step drop at epoch %d",
+        args.warmupEpochs, args.warmupStartLr, args.lr, args.lrDrop,
+    )
+    vidDetrLogger.info(
+        "Gradient accumulation: %d steps (effective batch size = %d)",
+        args.accumSteps, args.batchSize * args.accumSteps,
+    )
     
     # Setup samplers
     if args.distributed:
         samplerTrain = DistributedSampler(datasetTrain)
-        samplerVal = DistributedSampler(datasetVal, shuffle=False)
     else:
         samplerTrain = torch.utils.data.RandomSampler(datasetTrain)
-        samplerVal = torch.utils.data.SequentialSampler(datasetVal)
     
     # Create dataloaders
     batchSamplerTrain = torch.utils.data.BatchSampler(
@@ -389,24 +439,30 @@ def main(args):
         pin_memory=True
     )
     
-    dataLoaderVal = DataLoader(
-        datasetVal,
-        args.batchSize,
-        sampler=samplerVal,
-        drop_last=False,
-        collate_fn=collateFn,
-        num_workers=args.numWorkers,
-        prefetch_factor=2 if args.numWorkers > 0 else None,
-        persistent_workers=args.numWorkers > 0,
-        pin_memory=True
-    )
+    dataLoaderVal = None
+    if datasetVal is not None:
+        if args.distributed:
+            samplerVal = DistributedSampler(datasetVal, shuffle=False)
+        else:
+            samplerVal = torch.utils.data.SequentialSampler(datasetVal)
+        dataLoaderVal = DataLoader(
+            datasetVal,
+            args.batchSize,
+            sampler=samplerVal,
+            drop_last=False,
+            collate_fn=collateFn,
+            num_workers=args.numWorkers,
+            prefetch_factor=2 if args.numWorkers > 0 else None,
+            persistent_workers=args.numWorkers > 0,
+            pin_memory=True
+        )
     
     # Setup output directory
     outputDir = Path(args.outputDir)
     
     # Load pretrained weights if specified
     if args.pretrainedDetr:
-        print(f"Loading pretrained DETR weights from {args.pretrainedDetr}")
+        vidDetrLogger.info("Loading pretrained DETR weights from %s", args.pretrainedDetr)
         checkpoint = torch.load(args.pretrainedDetr, map_location='cpu')
         
         # Load compatible weights (skip mismatched layers)
@@ -417,17 +473,17 @@ def main(args):
         }
         notLoaded = set(modelDict.keys()) - set(pretrainedDict.keys())
         if notLoaded:
-            print(f"Warning: {len(notLoaded)} parameters not loaded from pretrained weights:")
-            for k in list(notLoaded):  # Print up to 10 missing keys
-                print(f"  {k}")
+            vidDetrLogger.warning("%d parameters not loaded from pretrained weights:", len(notLoaded))
+            for k in list(notLoaded):
+                vidDetrLogger.warning("  %s", k)
         modelDict.update(pretrainedDict)
         modelWithoutDdp.load_state_dict(modelDict, strict=False)
-        print(f"Loaded {len(pretrainedDict)}/{len(checkpoint['model'])} pretrained weights")
+        vidDetrLogger.info("Loaded %d/%d pretrained weights", len(pretrainedDict), len(checkpoint['model']))
     
     # Resume from checkpoint
     bestMetric = float('inf')  # Initialize best metric tracker
     if args.resume:
-        print(f"Resuming from checkpoint: {args.resume}")
+        vidDetrLogger.info("Resuming from checkpoint: %s", args.resume)
         checkpoint = torch.load(args.resume, map_location='cpu')
         modelWithoutDdp.load_state_dict(checkpoint['model'])
         
@@ -438,22 +494,38 @@ def main(args):
             # Restore best metric if available
             if 'best_metric' in checkpoint:
                 bestMetric = checkpoint['best_metric']
-                print(f"Restored best metric: {bestMetric:.4f}")
+                vidDetrLogger.info("Restored best metric: %.4f", bestMetric)
+        
+        # Restore EMA state if available
+        if emaModel is not None and 'ema_state_dict' in checkpoint:
+            emaModel.module.load_state_dict(checkpoint['ema_state_dict'])
+            vidDetrLogger.info("Restored EMA state")
     
     # Evaluation only
     if args.eval:
+        if dataLoaderVal is None:
+            vidDetrLogger.error("Cannot evaluate: no validation set (--mergeTrainVal is active)")
+            return
+        valTracker = MetricTracker(outputDir=args.outputDir, phase="val")
         testStats = evaluate(
             model, criterion, postprocessors,
-            dataLoaderVal, device, args.outputDir
+            dataLoaderVal, device, args.outputDir,
+            tracker=valTracker, epoch=0,
         )
-        print(f"Evaluation results: {testStats}")
+        vidDetrLogger.info("Evaluation results: %s", testStats)
         return
 
     if args.freezeBackbone:
         model.freezeBackbone(freeze=False)
     
+    # Create metric trackers for CSV logging
+    trainTracker = MetricTracker(outputDir=args.outputDir, phase="train")
+    valTracker = MetricTracker(outputDir=args.outputDir, phase="val") if dataLoaderVal is not None else None
+
     # Training loop
-    print("Starting training...")
+    vidDetrLogger.info("Starting training...")
+    if mergeTrainVal:
+        vidDetrLogger.info("*** mergeTrainVal is ON — no validation will be performed ***")
     startTime = time.time()
     # bestMetric already initialized above (either from checkpoint or float('inf'))
     
@@ -465,16 +537,22 @@ def main(args):
         trainStats = trainOneEpoch(
             model, criterion, dataLoaderTrain,
             optimizer, device, epoch, args.clipMaxNorm,
-            accumSteps=args.accumSteps
+            accumSteps=args.accumSteps,
+            tracker=trainTracker,
+            emaModel=emaModel,
         )
         
         lrScheduler.step()
         
-        # Evaluate
-        testStats = evaluate(
-            model, criterion, postprocessors,
-            dataLoaderVal, device, args.outputDir
-        )
+        # Evaluate (skip when train+val are merged)
+        testStats: Dict[str, float] = {}
+        if dataLoaderVal is not None:
+            evalModel = emaModel.module if emaModel is not None else model
+            testStats = evaluate(
+                evalModel, criterion, postprocessors,
+                dataLoaderVal, device, args.outputDir,
+                tracker=valTracker, epoch=epoch,
+            )
         
         # Save checkpoint after every epoch
         if args.outputDir:
@@ -489,12 +567,14 @@ def main(args):
             checkpointPaths.append(latestCheckpoint)
             
             # 3. Check if this is the best model so far (lowest validation loss)
-            currentMetric = testStats.get('loss', float('inf'))
-            if currentMetric < bestMetric:
-                bestMetric = currentMetric
-                bestCheckpoint = outputDir / 'video_detr_best.pth'
-                checkpointPaths.append(bestCheckpoint)
-                print(f"*** New best model at epoch {epoch+1} with loss={currentMetric:.4f} ***")
+            #    Only meaningful when a validation set exists.
+            if testStats:
+                currentMetric = testStats.get('loss_mean', float('inf'))
+                if currentMetric < bestMetric:
+                    bestMetric = currentMetric
+                    bestCheckpoint = outputDir / 'video_detr_best.pth'
+                    checkpointPaths.append(bestCheckpoint)
+                    vidDetrLogger.info("*** New best model at epoch %d with loss=%.4f ***", epoch + 1, currentMetric)
             
             # Save all checkpoint paths
             checkpoint_data = {
@@ -506,27 +586,34 @@ def main(args):
                 'args': args,
             }
             
+            # Include EMA state in checkpoint
+            if emaModel is not None:
+                checkpoint_data['ema_state_dict'] = emaModel.module.state_dict()
+            
             for checkpointPath in checkpointPaths:
                 utils.save_on_master(checkpoint_data, checkpointPath)
             
-            print(f"Checkpoints saved: {[p.name for p in checkpointPaths]}")
+            vidDetrLogger.info("Checkpoints saved: %s", [p.name for p in checkpointPaths])
         
-        # Log stats
-        logStats = {
-            **{f'train_{k}': v for k, v in trainStats.items()},
-            **{f'test_{k}': v for k, v in testStats.items()},
-            'epoch': epoch,
-            'n_parameters': nParameters,
-            'best_metric': bestMetric
-        }
-        
-        if args.outputDir and utils.is_main_process():
-            with (outputDir / "log.txt").open("a") as f:
-                f.write(json.dumps(logStats) + "\n")
+        # Log epoch summary to the structured log
+        if testStats:
+            vidDetrLogger.info(
+                "Epoch %d summary — train_loss: %.4f  val_loss: %.4f  best: %.4f",
+                epoch,
+                trainStats.get('loss_mean', 0.0),
+                testStats.get('loss_mean', 0.0),
+                bestMetric,
+            )
+        else:
+            vidDetrLogger.info(
+                "Epoch %d summary — train_loss: %.4f",
+                epoch,
+                trainStats.get('loss_mean', 0.0),
+            )
     
     totalTime = time.time() - startTime
     totalTimeStr = str(datetime.timedelta(seconds=int(totalTime)))
-    print(f'Training completed in {totalTimeStr}')
+    vidDetrLogger.info('Training completed in %s', totalTimeStr)
 
 
 if __name__ == '__main__':
@@ -551,5 +638,5 @@ if __name__ == '__main__':
         
         Path(args.outputDir).mkdir(parents=True, exist_ok=True)
     
-    print(f"Using output directory: {args.outputDir}")
+    print(f"Using output directory: {args.outputDir}")  # before logger is set up
     main(args)

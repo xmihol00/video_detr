@@ -243,6 +243,40 @@ class RandomErasing(object):
         return self.eraser(img), target
 
 
+class ColorJitter(object):
+    """
+    Apply random color jitter to the image.
+    
+    This augmentation changes brightness, contrast, saturation, and hue
+    randomly, helping the model generalise across different lighting
+    conditions and camera characteristics.
+    """
+
+    def __init__(self, brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1):
+        self.jitter = T.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue,
+        )
+
+    def __call__(self, img, target):
+        return self.jitter(img), target
+
+
+class RandomGrayscale(object):
+    """Randomly convert image to grayscale."""
+
+    def __init__(self, p=0.1):
+        self.p = p
+
+    def __call__(self, img, target):
+        if random.random() < self.p:
+            # Convert to grayscale but keep 3 channels for model compatibility
+            img = img.convert('L').convert('RGB')
+        return img, target
+
+
 class Normalize(object):
     def __init__(self, mean, std):
         self.mean = mean

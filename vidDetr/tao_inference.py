@@ -29,6 +29,8 @@ Usage:
         --confidence 0.4
 """
 
+import time
+
 import safe_gpu
 while True:
     try:
@@ -79,7 +81,7 @@ def getArgsParser() -> argparse.ArgumentParser:
     # Required
     parser.add_argument(
         "--modelPath",
-        default="vidDetr_weights_1/video_detr_best.pth",
+        default="vidDetr_weights_1/checkpoint_latest.pth",
         type=str,
         help="Path to a VideoDETR checkpoint (.pth)",
     )
@@ -93,7 +95,7 @@ def getArgsParser() -> argparse.ArgumentParser:
     # What to process
     parser.add_argument(
         "--split",
-        default="validation",
+        default="train",
         type=str,
         choices=["train", "validation"],
         help="Which annotation split to use",
@@ -114,7 +116,7 @@ def getArgsParser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--nmsThreshold",
-        default=0.9,
+        default=0.75,
         type=float,
         help="IoU threshold for per-frame NMS",
     )
@@ -185,7 +187,7 @@ class TaoAnnotations:
     training pipeline uses so that predicted class IDs match GT class IDs.
     """
 
-    def __init__(self, jsonPath: str):
+    def __init__(self, jsonPath: str, taoMaxCategories: Optional[int] = None):
         print(f"[TAO] Loading annotations from {jsonPath} …")
         with open(jsonPath, "r") as f:
             data = json.load(f)
@@ -208,9 +210,20 @@ class TaoAnnotations:
             self.imageAnnotations[ann["image_id"]].append(ann)
 
         # ── Category mapping: original TAO id → contiguous 0..N-1 ────
-        # Must match what TaoDataset._buildCategoryMapping does with
-        # maxCategoriesUsed=None (all categories, sorted by original ID)
-        sortedCatIds = sorted(self.categories.keys())
+        # Must match what TaoDataset._buildCategoryMapping does.
+        # When taoMaxCategories is set, keep only the N most frequent
+        # categories (same logic as the training dataset builder).
+        if taoMaxCategories is not None:
+            catCounts: Dict[int, int] = defaultdict(int)
+            for ann in data["annotations"]:
+                catCounts[ann["category_id"]] += 1
+            topCats = sorted(
+                catCounts, key=lambda c: catCounts[c], reverse=True
+            )[:taoMaxCategories]
+            topCats.sort()  # deterministic ordering
+            sortedCatIds = topCats
+        else:
+            sortedCatIds = sorted(self.categories.keys())
         self.catIdToContiguous: Dict[int, int] = {
             origId: idx for idx, origId in enumerate(sortedCatIds)
         }
@@ -289,6 +302,40 @@ def _trackColour(trackId: int) -> Tuple[int, int, int]:
     """Deterministic colour per track ID for consistent visualisation."""
     rng = random.Random(trackId * 7 + 13)
     return (rng.randint(40, 255), rng.randint(40, 255), rng.randint(40, 255))
+
+
+def resizeForOutput(
+    bgrImage: np.ndarray, maxSize: int
+) -> Tuple[np.ndarray, float, float]:
+    """
+    Resize *bgrImage* so that its longest side equals *maxSize* (preserving
+    aspect ratio).  Returns ``(resizedImage, scaleX, scaleY)``.
+    """
+    h, w = bgrImage.shape[:2]
+    if max(h, w) <= maxSize:
+        return bgrImage, 1.0, 1.0
+    if h >= w:
+        newH = maxSize
+        newW = int(round(w * maxSize / h))
+    else:
+        newW = maxSize
+        newH = int(round(h * maxSize / w))
+    resized = cv2.resize(bgrImage, (newW, newH), interpolation=cv2.INTER_LINEAR)
+    return resized, newW / w, newH / h
+
+
+def scaleBoxes(
+    boxes: np.ndarray, scaleX: float, scaleY: float
+) -> np.ndarray:
+    """Scale absolute xyxy boxes by (scaleX, scaleY)."""
+    if len(boxes) == 0:
+        return boxes
+    scaled = boxes.copy()
+    scaled[:, 0] *= scaleX
+    scaled[:, 1] *= scaleY
+    scaled[:, 2] *= scaleX
+    scaled[:, 3] *= scaleY
+    return scaled
 
 
 # =========================================================================
@@ -760,10 +807,13 @@ def loadVideoFrames(
         if not p.suffix.lower() in (".jpg", ".jpeg", ".png"):
             continue
         # Parse frame index from e.g. "frame0391.jpg"
+        # NOTE: filenames are 1-based (frame0001.jpg is the first frame)
+        # but TAO JSON frame_index is 0-based (first frame = 0).
         stem = p.stem  # "frame0391"
         if stem.startswith("frame"):
             try:
-                fIdx = int(stem[5:])
+                fileIdx = int(stem[5:])           # 1-based from filename
+                fIdx = fileIdx - 1                 # 0-based to match JSON
             except ValueError:
                 continue
             frameFiles.append((fIdx, p))
@@ -809,22 +859,23 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"[TAO-Infer] Running on {device}")
 
+    # ── Load model (first, so we can read taoMaxCategories) ───────────
+    model, modelArgs = loadModel(args.modelPath, device)
+    numClasses = model.numClasses
+
     # ── Load TAO annotations ──────────────────────────────────────────
     taoRoot = Path(args.taoDataRoot)
     annPath = taoRoot / "annotations" / f"{args.split}.json"
     assert annPath.exists(), f"Annotation file not found: {annPath}"
-    taoAnns = TaoAnnotations(str(annPath))
-
-    # ── Load model ────────────────────────────────────────────────────
-    model, modelArgs = loadModel(args.modelPath, device)
-    numClasses = model.numClasses
+    taoMaxCategories = getattr(modelArgs, "taoMaxCategories", None)
+    taoAnns = TaoAnnotations(str(annPath), taoMaxCategories=taoMaxCategories)
 
     # Verify category counts match
     if numClasses != taoAnns.numClasses:
         print(
-            f"  ⚠  Model has {numClasses} classes but TAO has "
-            f"{taoAnns.numClasses} categories. Predictions may be misaligned "
-            f"if the training used --taoMaxCategories."
+            f"  ⚠  Model has {numClasses} classes but TAO annotations report "
+            f"{taoAnns.numClasses} categories (taoMaxCategories="
+            f"{taoMaxCategories}). Class predictions may be misaligned."
         )
 
     palette = _buildColourPalette(max(numClasses, taoAnns.numClasses))
@@ -887,7 +938,9 @@ def main():
         vidDir = outputRoot / safeName
         vidDir.mkdir(parents=True, exist_ok=True)
 
-        h, w = bgrFrames[0].shape[:2]
+        # Compute output resolution (resize first frame to get dims)
+        firstResized, _, _ = resizeForOutput(bgrFrames[0], args.maxSize)
+        outH, outW = firstResized.shape[:2]
 
         writer = None
         framesDir = None
@@ -900,7 +953,7 @@ def main():
             outVideoPath = vidDir / "video.mp4"
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(
-                str(outVideoPath), fourcc, args.fps, (w, h)
+                str(outVideoPath), fourcc, args.fps, (outW, outH)
             )
 
         totalPreds = 0
@@ -923,10 +976,18 @@ def main():
                 gtLabels = np.zeros((0,), dtype=np.int64)
                 gtTrackIds = np.zeros((0,), dtype=np.int64)
 
+            # Resize frame to output size and scale boxes accordingly
+            resizedBgr, scaleX, scaleY = resizeForOutput(bgr, args.maxSize)
+            gtBoxesScaled = scaleBoxes(gtBoxes, scaleX, scaleY)
+            predResultScaled = results[fPos].copy()
+            predResultScaled["boxes"] = scaleBoxes(
+                results[fPos]["boxes"], scaleX, scaleY
+            )
+
             vis = drawFrame(
-                bgr,
-                results[fPos],
-                gtBoxes,
+                resizedBgr,
+                predResultScaled,
+                gtBoxesScaled,
                 gtLabels,
                 gtTrackIds,
                 taoAnns,
@@ -959,7 +1020,7 @@ def main():
         with open(infoPath, "w") as f:
             f.write(f"Video ID       : {videoId}\n")
             f.write(f"Video name     : {videoName}\n")
-            f.write(f"Resolution     : {w}×{h}\n")
+            f.write(f"Resolution     : {outW}×{outH} (maxSize={args.maxSize})\n")
             f.write(f"Total frames   : {len(bgrFrames)}\n")
             f.write(f"Annotated      : {annotatedCount}\n")
             f.write(f"Total GT boxes : {totalGt}\n")

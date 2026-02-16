@@ -508,6 +508,8 @@ def makeTaoTransforms(imageSet: str, maxSize: int = 800):
     if imageSet == "train":
         return T.Compose([
             T.RandomHorizontalFlip(),
+            T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+            T.RandomGrayscale(p=0.05),
             T.RandomSelect(
                 T.RandomResize(scales, max_size=maxSize),
                 T.Compose([
@@ -517,6 +519,7 @@ def makeTaoTransforms(imageSet: str, maxSize: int = 800):
                 ]),
             ),
             normalize,
+            T.RandomErasing(p=0.1),
         ])
 
     if imageSet == "val":
@@ -547,7 +550,7 @@ def taoCollateFn(batch: List[Tuple]) -> Tuple[List[Any], List[List[Dict]]]:
 #  Builder
 # ======================================================================
 
-def buildTaoDataset(args) -> Tuple[Dataset, Dataset]:
+def buildTaoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
     """
     Build train and validation TAO datasets from ``args``.
 
@@ -559,9 +562,11 @@ def buildTaoDataset(args) -> Tuple[Dataset, Dataset]:
         maxSize           : int   – maximum image dimension
         numClasses        : int   – will be *overwritten* by the actual count
         taoMaxCategories  : int | None – keep only top-N categories
+        mergeTrainVal     : bool  – if True, merge val into train and return
+                                    ``(mergedDataset, None)``
 
     Returns:
-        (trainDataset, valDataset)
+        (trainDataset, valDataset)  — valDataset is ``None`` when merged.
     """
     root = Path(args.taoDataRoot)
     annDir = root / "annotations"
@@ -570,6 +575,7 @@ def buildTaoDataset(args) -> Tuple[Dataset, Dataset]:
 
     maxCat = getattr(args, "taoMaxCategories", None)
     maxSize = getattr(args, "maxSize", 800)
+    mergeTrainVal = getattr(args, "mergeTrainVal", False)
 
     datasetTrain = TaoDataset(
         dataRoot=str(root),
@@ -582,6 +588,35 @@ def buildTaoDataset(args) -> Tuple[Dataset, Dataset]:
         windowOverlap=getattr(args, "taoWindowOverlap", 0.5),
         maxCategoriesUsed=maxCat,
     )
+
+    if mergeTrainVal:
+        # Load validation split with *train* transforms and overlap so that
+        # all val data is used as additional training data.
+        datasetValAsTrain = TaoDataset(
+            dataRoot=str(root),
+            annotationFile=str(valJson),
+            numFrames=args.numFrames,
+            transforms=makeTaoTransforms("train", maxSize=maxSize),
+            imageSet="train",   # use train augmentations
+            minFrameGap=getattr(args, "minFrameGap", 1),
+            maxFrameGap=getattr(args, "maxFrameGap", 10),
+            windowOverlap=getattr(args, "taoWindowOverlap", 0.5),
+            maxCategoriesUsed=maxCat,
+        )
+
+        assert datasetTrain.numClasses == datasetValAsTrain.numClasses, (
+            f"Train ({datasetTrain.numClasses}) and val-as-train "
+            f"({datasetValAsTrain.numClasses}) have different category counts"
+        )
+
+        merged = torch.utils.data.ConcatDataset([datasetTrain, datasetValAsTrain])
+        args.numClasses = datasetTrain.numClasses
+        print(
+            f"[buildTaoDataset] mergeTrainVal: {len(datasetTrain)} + "
+            f"{len(datasetValAsTrain)} = {len(merged)} windows  "
+            f"(numClasses={args.numClasses})"
+        )
+        return merged, None
 
     datasetVal = TaoDataset(
         dataRoot=str(root),

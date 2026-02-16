@@ -238,6 +238,10 @@ class VideoCriterion(nn.Module):
         self.focalAlpha = focalAlpha
         self.focalGamma = focalGamma
         
+        # Duplicate suppression: penalize pairs of same-frame predictions
+        # that have high IoU with each other (both confidently predicting an object)
+        self.dupIouThreshold = 0.7  # IoU above which pairs are penalised
+        
         # Class weights for cross-entropy (downweight no-object) - used when not using focal loss
         emptyWeight = torch.ones(numClasses + 1)
         emptyWeight[-1] = eosCoef
@@ -542,11 +546,90 @@ class VideoCriterion(nn.Module):
             'labels': self.lossLabels,
             'cardinality': self.lossCardinality,
             'boxes': self.lossBoxes,
-            'tracking': self.lossTracking
+            'tracking': self.lossTracking,
+            'duplicates': self.lossDuplicates
         }
         
         assert loss in lossMap, f"Unknown loss: {loss}"
         return lossMap[loss](outputs, targets, indices, numBoxes, **kwargs)
+    
+    def lossDuplicates(
+        self,
+        outputs: Dict[str, Tensor],
+        targets: List[List[Dict]],
+        indices: List[List[Tuple]],
+        numBoxes: int,
+        **kwargs
+    ) -> Dict[str, Tensor]:
+        """
+        Duplicate suppression loss.
+        
+        Penalises pairs of predictions within the same frame that both have
+        high object confidence AND high IoU with each other.  This directly
+        discourages the model from placing multiple boxes on a single object.
+        
+        The loss is:  mean( IoU(b_i, b_j) * min(conf_i, conf_j) )
+        for all same-frame pairs where IoU > threshold.
+        """
+        assert 'pred_boxes' in outputs and 'pred_logits' in outputs
+        device = outputs['pred_boxes'].device
+        batchSize = outputs['pred_boxes'].shape[0]
+        
+        # Get objectness scores (probability of NOT being no-object)
+        if self.useFocalLoss:
+            # sigmoid-based: max prob across real classes
+            objScores = outputs['pred_logits'].sigmoid().max(dim=-1).values
+        else:
+            # softmax-based: 1 - prob(no-object)
+            probs = outputs['pred_logits'].softmax(dim=-1)
+            objScores = 1.0 - probs[..., -1]  # [B, numQueries]
+        
+        totalDupLoss = torch.tensor(0.0, device=device, requires_grad=True)
+        numPairs = 0
+        
+        for batchIdx in range(batchSize):
+            for frameIdx in range(self.numFrames):
+                startQ = frameIdx * self.queriesPerFrame
+                endQ = startQ + self.queriesPerFrame
+                
+                frameBoxes = outputs['pred_boxes'][batchIdx, startQ:endQ]  # [Q, 4]
+                frameScores = objScores[batchIdx, startQ:endQ]  # [Q]
+                
+                # Only consider predictions with moderate confidence
+                confMask = frameScores > 0.3
+                if confMask.sum() < 2:
+                    continue
+                
+                confBoxes = frameBoxes[confMask]  # [M, 4]
+                confScores = frameScores[confMask]  # [M]
+                
+                # Compute pairwise IoU
+                ious = box_ops.box_iou(
+                    box_ops.box_cxcywh_to_xyxy(confBoxes),
+                    box_ops.box_cxcywh_to_xyxy(confBoxes)
+                )[0]  # [M, M]
+                
+                # Mask out diagonal and lower triangle
+                M = confBoxes.shape[0]
+                upperMask = torch.triu(torch.ones(M, M, device=device, dtype=torch.bool), diagonal=1)
+                highIouMask = (ious > self.dupIouThreshold) & upperMask
+                
+                if not highIouMask.any():
+                    continue
+                
+                # For each high-IoU pair, penalty = IoU * min(score_i, score_j)
+                pairIous = ious[highIouMask]
+                rows, cols = torch.where(highIouMask)
+                pairMinScores = torch.min(confScores[rows], confScores[cols])
+                
+                pairLoss = (pairIous * pairMinScores).sum()
+                totalDupLoss = totalDupLoss + pairLoss
+                numPairs += highIouMask.sum().item()
+        
+        if numPairs > 0:
+            totalDupLoss = totalDupLoss / max(numPairs, 1)
+        
+        return {'loss_duplicates': totalDupLoss}
     
     def forward(
         self,
@@ -606,6 +689,9 @@ class VideoCriterion(nn.Module):
                 for loss in self.losses:
                     if loss == 'tracking':
                         # Skip tracking loss for intermediate layers (optional)
+                        continue
+                    if loss == 'duplicates':
+                        # Skip duplicate loss for intermediate layers
                         continue
                     
                     kwargs = {}
@@ -807,7 +893,8 @@ def buildVideoCriterion(args) -> VideoCriterion:
         'loss_ce': ceLossCoef,
         'loss_bbox': args.bboxLossCoef,
         'loss_giou': args.giouLossCoef,
-        'loss_tracking': getattr(args, 'trackingLossCoef', 1.0)
+        'loss_tracking': getattr(args, 'trackingLossCoef', 1.0),
+        'loss_duplicates': getattr(args, 'dupLossCoef', 0.5)
     }
     
     # Add denoising loss weights (same coefficients as matching losses)
@@ -822,12 +909,12 @@ def buildVideoCriterion(args) -> VideoCriterion:
         auxWeightDict = {}
         for i in range(args.decLayers - 1):
             auxWeightDict.update({k + f'_{i}': v for k, v in weightDict.items()})
-        # Remove tracking from aux (computed only at the last layer)
-        auxWeightDict = {k: v for k, v in auxWeightDict.items() if 'tracking' not in k}
+        # Remove tracking and duplicates from aux (computed only at the last layer)
+        auxWeightDict = {k: v for k, v in auxWeightDict.items() if 'tracking' not in k and 'duplicates' not in k}
         weightDict.update(auxWeightDict)
         print(f"[buildVideoCriterion] Auxiliary losses enabled for {args.decLayers - 1} decoder layers")
     
-    losses = ['labels', 'boxes', 'cardinality', 'tracking']
+    losses = ['labels', 'boxes', 'cardinality', 'tracking', 'duplicates']
     
     criterion = VideoCriterion(
         numClasses=args.numClasses,

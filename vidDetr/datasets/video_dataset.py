@@ -519,6 +519,8 @@ def makeVideoTransforms(imageSet: str, maxSize: int = 800):
     if imageSet == 'train':
         return T.Compose([
             T.RandomHorizontalFlip(),
+            T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+            T.RandomGrayscale(p=0.05),
             T.RandomSelect(
                 T.RandomResize(scales, max_size=maxSize),
                 T.Compose([
@@ -528,6 +530,7 @@ def makeVideoTransforms(imageSet: str, maxSize: int = 800):
                 ])
             ),
             normalize,
+            T.RandomErasing(p=0.1),
         ])
     
     if imageSet == 'val':
@@ -581,15 +584,19 @@ def videoCollateFn(batch: List[Tuple]) -> Tuple[List[Any], List[List[Dict]]]:
     return framesPerTimestep, targetsPerTimestep
 
 
-def buildVideoDataset(args) -> Tuple[Dataset, Dataset]:
+def buildVideoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
     """
     Build train and validation datasets from args.
     
     Args:
-        args: Argument namespace with dataset configuration
+        args: Argument namespace with dataset configuration.
+              If ``args.mergeTrainVal`` is True, the validation split is
+              loaded with training augmentations, concatenated with the
+              training split, and returned as ``(mergedDataset, None)``.
         
     Returns:
-        Tuple of (trainDataset, valDataset)
+        Tuple of (trainDataset, valDataset).  ``valDataset`` is ``None``
+        when ``mergeTrainVal`` is enabled.
     """
     # Load data config from yaml
     dataConfigPath = Path(args.dataConfig)
@@ -606,9 +613,10 @@ def buildVideoDataset(args) -> Tuple[Dataset, Dataset]:
     if valRoot.endswith('/images'):
         valRoot = valRoot[:-7]
     
+    mergeTrainVal = getattr(args, 'mergeTrainVal', False)
+    
     # Build datasets
     trainTransforms = makeVideoTransforms('train', maxSize=args.maxSize)
-    valTransforms = makeVideoTransforms('val', maxSize=args.maxSize)
     
     trainDataset = VideoSequenceDataset(
         dataRoot=trainRoot,
@@ -620,6 +628,28 @@ def buildVideoDataset(args) -> Tuple[Dataset, Dataset]:
         maxFrameGap=args.maxFrameGap,
         classNames=classNames
     )
+    
+    if mergeTrainVal:
+        # Load validation split with *train* transforms so it acts as
+        # additional training data.
+        valAsTrainDataset = VideoSequenceDataset(
+            dataRoot=valRoot,
+            numFrames=args.numFrames,
+            transforms=trainTransforms,
+            imageSet='train',   # use train augmentations & sampling
+            framesPerSequence=args.framesPerSequence,
+            minFrameGap=args.minFrameGap,
+            maxFrameGap=args.maxFrameGap,
+            classNames=classNames
+        )
+        merged = torch.utils.data.ConcatDataset([trainDataset, valAsTrainDataset])
+        print(
+            f"[buildVideoDataset] mergeTrainVal: {len(trainDataset)} + "
+            f"{len(valAsTrainDataset)} = {len(merged)} sequences"
+        )
+        return merged, None
+    
+    valTransforms = makeVideoTransforms('val', maxSize=args.maxSize)
     
     valDataset = VideoSequenceDataset(
         dataRoot=valRoot,

@@ -3,7 +3,7 @@
 cd "/homes/eva/xm/xmihol00"
 source setup.sh
 conda activate orig_yolo
-cd "/mnt/matylda5/xmihol00/video_detr/"
+cd "/homes/eva/xm/xmihol00/video_detr/"
 
 current_time=$(date +"%Y-%m-%d_%H-%M-%S")
 echo "Training started at: $current_time"
