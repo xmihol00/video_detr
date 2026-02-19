@@ -92,6 +92,18 @@ class DenoisingGenerator(nn.Module):
         
         self._initWeights()
     
+    def updateEpochParams(self, params: dict) -> None:
+        """Update denoising parameters for the current epoch.
+
+        Args:
+            params: Dict with resolved per-epoch values.  Recognised keys:
+                    ``labelNoiseRatio``, ``boxNoiseScale``.
+        """
+        if 'labelNoiseRatio' in params:
+            self.labelNoiseRatio = params['labelNoiseRatio']
+        if 'boxNoiseScale' in params:
+            self.boxNoiseScale = params['boxNoiseScale']
+    
     def _initWeights(self):
         """Initialize embeddings."""
         nn.init.xavier_uniform_(self.labelEmbed.weight)

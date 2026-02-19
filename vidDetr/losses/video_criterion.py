@@ -223,7 +223,9 @@ class VideoCriterion(nn.Module):
         contrastiveTemp: float = 0.07,
         useFocalLoss: bool = True,
         focalAlpha: float = 0.25,
-        focalGamma: float = 2.0
+        focalGamma: float = 2.0,
+        numAuxLayers: int = 0,
+        useDnDenoising: bool = False,
     ):
         super().__init__()
         
@@ -237,6 +239,8 @@ class VideoCriterion(nn.Module):
         self.useFocalLoss = useFocalLoss
         self.focalAlpha = focalAlpha
         self.focalGamma = focalGamma
+        self.numAuxLayers = numAuxLayers
+        self.useDnDenoising = useDnDenoising
         
         # Duplicate suppression: penalize pairs of same-frame predictions
         # that have high IoU with each other (both confidently predicting an object)
@@ -257,6 +261,69 @@ class VideoCriterion(nn.Module):
         else:
             print(f"[VideoCriterion] Using cross-entropy (eos_coef={eosCoef})")
     
+    def updateEpochParams(self, params: Dict[str, float]) -> None:
+        """
+        Update criterion hyperparameters for the current epoch.
+
+        Called from the training loop before each epoch with the resolved
+        per-epoch scheduled values.
+
+        Args:
+            params: Dict mapping parameter names to their scalar values
+                    for this epoch (e.g. ``{'bboxLossCoef': 5.0, ...}``).
+        """
+        # ---- Focal loss parameters ----
+        self.focalAlpha = params.get('focalAlpha', self.focalAlpha)
+        self.focalGamma = params.get('focalGamma', self.focalGamma)
+
+        # ---- EOS coefficient (no-object weight for cross-entropy) ----
+        newEos = params.get('eosCoef', self.eosCoef)
+        if newEos != self.eosCoef:
+            self.eosCoef = newEos
+            self.emptyWeight[-1] = newEos
+
+        # ---- Contrastive temperature ----
+        contrastiveTemp = params.get('contrastiveTemp', None)
+        if contrastiveTemp is not None:
+            self.contrastiveLoss.updateTemperature(contrastiveTemp)
+
+        # ---- Matcher costs ----
+        self.matcher.costClass = params.get('setCostClass', self.matcher.costClass)
+        self.matcher.costBbox = params.get('setCostBbox', self.matcher.costBbox)
+        self.matcher.costGiou = params.get('setCostGiou', self.matcher.costGiou)
+
+        # ---- Rebuild weight dict ----
+        ceLossCoef = 2.0 if self.useFocalLoss else 1.0
+        bboxLossCoef = params.get('bboxLossCoef', self.weightDict.get('loss_bbox', 5.0))
+        giouLossCoef = params.get('giouLossCoef', self.weightDict.get('loss_giou', 2.0))
+        trackingLossCoef = params.get('trackingLossCoef', self.weightDict.get('loss_tracking', 1.0))
+        dupLossCoef = params.get('dupLossCoef', self.weightDict.get('loss_duplicates', 0.5))
+
+        baseWeights = {
+            'loss_ce': ceLossCoef,
+            'loss_bbox': bboxLossCoef,
+            'loss_giou': giouLossCoef,
+            'loss_tracking': trackingLossCoef,
+            'loss_duplicates': dupLossCoef,
+        }
+
+        if self.useDnDenoising:
+            dnLossCoef = params.get('dnLossCoef', 1.0)
+            baseWeights['loss_dn_ce'] = ceLossCoef * dnLossCoef
+            baseWeights['loss_dn_bbox'] = bboxLossCoef * dnLossCoef
+            baseWeights['loss_dn_giou'] = giouLossCoef * dnLossCoef
+
+        # Auxiliary layer weights mirror the base weights
+        if self.numAuxLayers > 0:
+            auxWeights = {}
+            for i in range(self.numAuxLayers):
+                for k, v in baseWeights.items():
+                    if 'tracking' not in k and 'duplicates' not in k:
+                        auxWeights[k + f'_{i}'] = v
+            baseWeights.update(auxWeights)
+
+        self.weightDict.update(baseWeights)
+
     def lossLabels(
         self,
         outputs: Dict[str, Tensor],
@@ -894,16 +961,27 @@ def buildVideoCriterion(args) -> VideoCriterion:
     Build VideoCriterion from args.
     
     Args:
-        args: Argument namespace with configuration
+        args: Argument namespace with configuration.  Scheduled
+              hyperparameters may be either a scalar float or a
+              list of floats (per-epoch schedule).  This builder
+              uses the *first* value of each list for initial
+              construction; call ``criterion.updateEpochParams()``
+              before each epoch to apply the schedule.
         
     Returns:
         VideoCriterion module
     """
+    def _first(val):
+        """Return the first element if *val* is a list, else *val* itself."""
+        if isinstance(val, list):
+            return val[0]
+        return val
+
     # Build matcher
     matcher = VideoHungarianMatcher(
-        costClass=args.setCostClass,
-        costBbox=args.setCostBbox,
-        costGiou=args.setCostGiou,
+        costClass=_first(args.setCostClass),
+        costBbox=_first(args.setCostBbox),
+        costGiou=_first(args.setCostGiou),
         numFrames=args.numFrames,
         queriesPerFrame=args.queriesPerFrame
     )
@@ -916,30 +994,39 @@ def buildVideoCriterion(args) -> VideoCriterion:
     # produces smaller values due to the (1-pt)^gamma factor
     ceLossCoef = 2.0 if useFocalLoss else 1.0
     
+    bboxLossCoef = _first(args.bboxLossCoef)
+    giouLossCoef = _first(args.giouLossCoef)
+    trackingLossCoef = _first(getattr(args, 'trackingLossCoef', 1.0))
+    dupLossCoef = _first(getattr(args, 'dupLossCoef', 0.5))
+    
     weightDict = {
         'loss_ce': ceLossCoef,
-        'loss_bbox': args.bboxLossCoef,
-        'loss_giou': args.giouLossCoef,
-        'loss_tracking': getattr(args, 'trackingLossCoef', 1.0),
-        'loss_duplicates': getattr(args, 'dupLossCoef', 0.5)
+        'loss_bbox': bboxLossCoef,
+        'loss_giou': giouLossCoef,
+        'loss_tracking': trackingLossCoef,
+        'loss_duplicates': dupLossCoef
     }
     
     # Add denoising loss weights (same coefficients as matching losses)
     if useDnDenoising:
-        dnLossCoef = getattr(args, 'dnLossCoef', 1.0)
+        dnLossCoef = _first(getattr(args, 'dnLossCoef', 1.0))
         weightDict['loss_dn_ce'] = ceLossCoef * dnLossCoef
-        weightDict['loss_dn_bbox'] = args.bboxLossCoef * dnLossCoef
-        weightDict['loss_dn_giou'] = args.giouLossCoef * dnLossCoef
+        weightDict['loss_dn_bbox'] = bboxLossCoef * dnLossCoef
+        weightDict['loss_dn_giou'] = giouLossCoef * dnLossCoef
+    
+    # Store auxiliary loss configuration for later epoch updates
+    hasAuxLoss = args.auxLoss
+    numAuxLayers = args.decLayers - 1 if hasAuxLoss else 0
     
     # Add auxiliary loss weights
-    if args.auxLoss:
+    if hasAuxLoss:
         auxWeightDict = {}
-        for i in range(args.decLayers - 1):
+        for i in range(numAuxLayers):
             auxWeightDict.update({k + f'_{i}': v for k, v in weightDict.items()})
         # Remove tracking and duplicates from aux (computed only at the last layer)
         auxWeightDict = {k: v for k, v in auxWeightDict.items() if 'tracking' not in k and 'duplicates' not in k}
         weightDict.update(auxWeightDict)
-        print(f"[buildVideoCriterion] Auxiliary losses enabled for {args.decLayers - 1} decoder layers")
+        print(f"[buildVideoCriterion] Auxiliary losses enabled for {numAuxLayers} decoder layers")
     
     losses = ['labels', 'boxes', 'cardinality', 'tracking', 'duplicates']
     
@@ -947,14 +1034,16 @@ def buildVideoCriterion(args) -> VideoCriterion:
         numClasses=args.numClasses,
         matcher=matcher,
         weightDict=weightDict,
-        eosCoef=args.eosCoef,
+        eosCoef=_first(args.eosCoef),
         losses=losses,
         numFrames=args.numFrames,
         queriesPerFrame=args.queriesPerFrame,
-        contrastiveTemp=getattr(args, 'contrastiveTemp', 0.07),
+        contrastiveTemp=_first(getattr(args, 'contrastiveTemp', 0.07)),
         useFocalLoss=useFocalLoss,
-        focalAlpha=getattr(args, 'focalAlpha', 0.25),
-        focalGamma=getattr(args, 'focalGamma', 2.0)
+        focalAlpha=_first(getattr(args, 'focalAlpha', 0.25)),
+        focalGamma=_first(getattr(args, 'focalGamma', 2.0)),
+        numAuxLayers=numAuxLayers,
+        useDnDenoising=useDnDenoising,
     )
     
     print(f"[buildVideoCriterion] Weight dict keys: {list(weightDict.keys())}")

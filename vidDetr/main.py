@@ -29,7 +29,7 @@ import datetime
 import os
 import random
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -60,6 +60,73 @@ while True:
         time.sleep(5)
         pass
 
+# ---------------------------------------------------------------------------
+# Per-epoch hyperparameter scheduling
+# ---------------------------------------------------------------------------
+
+# Names of all arguments that support per-epoch scheduling (list of floats).
+# Each is stored as a list; at epoch *e* the value used is
+#     schedule[min(e, len(schedule) - 1)]
+SCHEDULED_PARAM_NAMES: List[str] = [
+    'focalAlpha', 'focalGamma',
+    'setCostClass', 'setCostBbox', 'setCostGiou',
+    'bboxLossCoef', 'giouLossCoef',
+    'eosCoef',
+    'trackingLossCoef', 'contrastiveTemp',
+    'labelNoiseRatio', 'boxNoiseScale',
+    'dnLossCoef', 'dupLossCoef',
+    'dropout', 'dropPathRate',
+    'clipMaxNorm',
+]
+
+
+def getScheduledValue(schedule: List[float], epoch: int) -> float:
+    """
+    Return the value from *schedule* for the given *epoch*.
+
+    If the list is shorter than ``epoch + 1``, the last value is reused.
+    """
+    return schedule[min(epoch, len(schedule) - 1)]
+
+
+def resolveEpochParams(args, epoch: int) -> Dict[str, float]:
+    """
+    Resolve all scheduled parameters for the given *epoch* and return
+    a dict ``{paramName: value}``.
+    """
+    resolved: Dict[str, float] = {}
+    for name in SCHEDULED_PARAM_NAMES:
+        # Special case: dropout may have been converted to scalar by
+        # convertArgsForTransformer; the original schedule is stored
+        # in ``_dropoutSchedule``.
+        if name == 'dropout':
+            schedule = getattr(args, '_dropoutSchedule', None)
+            if schedule is None:
+                schedule = getattr(args, 'dropout', None)
+        else:
+            schedule = getattr(args, name, None)
+
+        if schedule is not None and isinstance(schedule, list):
+            resolved[name] = getScheduledValue(schedule, epoch)
+        else:
+            # Fallback: the attribute is already a scalar (shouldn't happen
+            # after parser changes, but be safe).
+            resolved[name] = float(schedule) if schedule is not None else 0.0
+    return resolved
+
+
+def logEpochScheduledParams(
+    logger, epoch: int, params: Dict[str, float]
+) -> None:
+    """
+    Log the resolved per-epoch hyperparameters in a readable table.
+    """
+    lines = [f"Epoch [{epoch}] scheduled hyperparameters:"]
+    for name, value in params.items():
+        lines.append(f"  {name:>20s} = {value}")
+    logger.info("\n".join(lines))
+
+
 def getArgsParser():
     """
     Create argument parser with all configuration options.
@@ -77,7 +144,7 @@ def getArgsParser():
                         help='Base learning rate')
     parser.add_argument('--lrBackbone', default=1e-5, type=float,
                         help='Learning rate for backbone')
-    parser.add_argument('--batchSize', default=32, type=int,
+    parser.add_argument('--batchSize', default=48, type=int,
                         help='Batch size per GPU')
     parser.add_argument('--weightDecay', default=1e-4, type=float,
                         help='Weight decay')
@@ -85,8 +152,8 @@ def getArgsParser():
                         help='Number of training epochs')
     parser.add_argument('--lrDrop', default=80, type=int,
                         help='Epoch to drop learning rate')
-    parser.add_argument('--clipMaxNorm', default=0.1, type=float,
-                        help='Gradient clipping max norm')
+    parser.add_argument('--clipMaxNorm', default=[0.1], nargs='+', type=float,
+                        help='Gradient clipping max norm; per-epoch schedule')
     
     # Warmup parameters
     parser.add_argument('--warmupEpochs', default=2, type=int,
@@ -121,8 +188,8 @@ def getArgsParser():
                         help='Feedforward dimension in transformer')
     parser.add_argument('--hiddenDim', default=256, type=int,
                         help='Transformer hidden dimension')
-    parser.add_argument('--dropout', default=0.2, type=float,
-                        help='Dropout rate in transformer and heads')
+    parser.add_argument('--dropout', default=[0.0, 0.1, 0.1, 0.2], nargs='+', type=float,
+                        help='Dropout rate in transformer and heads; per-epoch schedule')
     parser.add_argument('--nheads', default=8, type=int,
                         help='Number of attention heads')
     parser.add_argument('--preNorm', action='store_true',
@@ -147,26 +214,26 @@ def getArgsParser():
                         help='Use focal loss instead of cross-entropy for classification')
     parser.add_argument('--noFocalLoss', dest='useFocalLoss', action='store_false',
                         help='Disable focal loss, use cross-entropy instead')
-    parser.add_argument('--focalAlpha', default=0.25, type=float,
-                        help='Focal loss alpha (balancing factor)')
-    parser.add_argument('--focalGamma', default=2.0, type=float,
-                        help='Focal loss gamma (focusing parameter)')
-    parser.add_argument('--setCostClass', default=2.0, type=float,
-                        help='Classification cost in matching')
-    parser.add_argument('--setCostBbox', default=5.0, type=float,
-                        help='L1 box cost in matching')
-    parser.add_argument('--setCostGiou', default=2.0, type=float,
-                        help='GIoU cost in matching')
-    parser.add_argument('--bboxLossCoef', default=5.0, type=float,
-                        help='L1 box loss coefficient')
-    parser.add_argument('--giouLossCoef', default=2.0, type=float,
-                        help='GIoU loss coefficient')
-    parser.add_argument('--eosCoef', default=0.05, type=float,
-                        help='No-object class weight (higher = fewer false positives)')
-    parser.add_argument('--trackingLossCoef', default=0.2, type=float,
-                        help='Tracking contrastive loss coefficient')
-    parser.add_argument('--contrastiveTemp', default=0.07, type=float,
-                        help='Temperature for contrastive loss')
+    parser.add_argument('--focalAlpha', default=[0.25], nargs='+', type=float,
+                        help='Focal loss alpha (balancing factor); per-epoch schedule')
+    parser.add_argument('--focalGamma', default=[2.0], nargs='+', type=float,
+                        help='Focal loss gamma (focusing parameter); per-epoch schedule')
+    parser.add_argument('--setCostClass', default=[4.0, 3.75, 3.5, 3.0], nargs='+', type=float,
+                        help='Classification cost in matching; per-epoch schedule')
+    parser.add_argument('--setCostBbox', default=[5.0], nargs='+', type=float,
+                        help='L1 box cost in matching; per-epoch schedule')
+    parser.add_argument('--setCostGiou', default=[2.0], nargs='+', type=float,
+                        help='GIoU cost in matching; per-epoch schedule')
+    parser.add_argument('--bboxLossCoef', default=[5.0], nargs='+', type=float,
+                        help='L1 box loss coefficient; per-epoch schedule')
+    parser.add_argument('--giouLossCoef', default=[2.0], nargs='+', type=float,
+                        help='GIoU loss coefficient; per-epoch schedule')
+    parser.add_argument('--eosCoef', default=[0.035, 0.05, 0.1, 0.15, 0.2], nargs='+', type=float,
+                        help='No-object class weight (higher = fewer false positives); per-epoch schedule')
+    parser.add_argument('--trackingLossCoef', default=[0.0, 0.05, 0.1, 0.25, 0.5, 0.75], nargs='+', type=float,
+                        help='Tracking contrastive loss coefficient; per-epoch schedule')
+    parser.add_argument('--contrastiveTemp', default=[0.07], nargs='+', type=float,
+                        help='Temperature for contrastive loss; per-epoch schedule')
     
     # Label denoising (DN-DETR / DINO) parameters
     parser.add_argument('--useDnDenoising', action='store_true', default=False,
@@ -175,16 +242,16 @@ def getArgsParser():
                         help='Disable label denoising')
     parser.add_argument('--numDnGroups', default=5, type=int,
                         help='Number of denoising groups (each group = noised copy of all GTs)')
-    parser.add_argument('--labelNoiseRatio', default=0.5, type=float,
-                        help='Probability of flipping a label to random class in DN queries')
-    parser.add_argument('--boxNoiseScale', default=0.4, type=float,
-                        help='Scale of box coordinate noise (fraction of box size)')
-    parser.add_argument('--dnLossCoef', default=1.0, type=float,
-                        help='Coefficient for denoising losses (multiplied with base loss coefs)')
+    parser.add_argument('--labelNoiseRatio', default=[0.5], nargs='+', type=float,
+                        help='Probability of flipping a label to random class in DN queries; per-epoch schedule')
+    parser.add_argument('--boxNoiseScale', default=[0.4], nargs='+', type=float,
+                        help='Scale of box coordinate noise (fraction of box size); per-epoch schedule')
+    parser.add_argument('--dnLossCoef', default=[1.0], nargs='+', type=float,
+                        help='Coefficient for denoising losses (multiplied with base loss coefs); per-epoch schedule')
     
     # Duplicate suppression loss
-    parser.add_argument('--dupLossCoef', default=0.0, type=float,
-                        help='Weight for IoU-based duplicate suppression loss')
+    parser.add_argument('--dupLossCoef', default=[0.0, 0.1, 0.25, 0.5, 1.0, 1.5], nargs='+', type=float,
+                        help='Weight for IoU-based duplicate suppression loss; per-epoch schedule')
     
     # EMA (Exponential Moving Average)
     parser.add_argument('--useEma', action='store_true', default=False,
@@ -195,8 +262,8 @@ def getArgsParser():
                         help='EMA decay rate')
     
     # Drop path (stochastic depth)
-    parser.add_argument('--dropPathRate', default=0.1, type=float,
-                        help='Drop path rate for stochastic depth regularization')
+    parser.add_argument('--dropPathRate', default=[0.0, 0.025, 0.05, 0.075, 0.1], nargs='+', type=float,
+                        help='Drop path rate for stochastic depth regularization; per-epoch schedule')
     
     # Dataset parameters
     parser.add_argument('--dataConfig', default='vidDetr/data.yaml', type=str,
@@ -211,6 +278,9 @@ def getArgsParser():
                         help='Maximum gap between sampled frames')
     parser.add_argument('--maxSize', default=384, type=int,
                         help='Maximum image size after transforms')
+    parser.add_argument('--minBoxSize', default=0.2, type=float,
+                        help='Minimum GT box size as fraction of image width or height; '
+                             'boxes whose normalised w AND h are both below this threshold are dropped')
     
     # TAO dataset parameters
     parser.add_argument('--taoDataRoot', default=None, #'/mnt/matylda5/xmihol00/tao/dataset/', 
@@ -231,7 +301,7 @@ def getArgsParser():
                         help='Directory to save checkpoints')
     parser.add_argument('--device', default='cuda',
                         help='Device for training')
-    parser.add_argument('--seed', default=random.randint(0, 22**32-1), type=int,
+    parser.add_argument('--seed', default=random.randint(0, 2**32-1), type=int,
                         help='Random seed')
     parser.add_argument('--resume', default='', type=str,
                         help='Path to checkpoint to resume from')
@@ -254,10 +324,10 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    #parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-02-19/checkpoint_latest.pth', type=str,
-    #                    help='Path to pretrained DETR weights')
-    parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
-                    help='Path to pretrained DETR weights')
+    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-02-19/checkpoint_latest.pth', type=str,
+                        help='Path to pretrained DETR weights')
+    #parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
+    #                help='Path to pretrained DETR weights')
     
     return parser
 
@@ -281,12 +351,26 @@ def convertArgsForBackbone(args):
 def convertArgsForTransformer(args):
     """
     Convert VideoDETR args to format expected by transformer builder.
+    
+    Note: ``args.dropout`` may be a list (per-epoch schedule).  The DETR
+    transformer builder expects a scalar, so we store the original list
+    in ``args._dropoutSchedule`` and set ``args.dropout`` to the first
+    value for the builder.  ``resolveEpochParams`` reads from the
+    schedule list.
     """
     args.enc_layers = args.encLayers
     args.dec_layers = args.decLayers
     args.dim_feedforward = args.dimFeedforward
     args.hidden_dim = args.hiddenDim
     args.pre_norm = args.preNorm
+    
+    # Transformer builder expects a scalar dropout — preserve the
+    # original schedule in a private attribute.
+    if isinstance(args.dropout, list):
+        args._dropoutSchedule = args.dropout
+        args.dropout = args.dropout[0]
+    else:
+        args._dropoutSchedule = [args.dropout]
     
     return args
 
@@ -325,6 +409,13 @@ def main(args):
     # Convert args for compatibility
     args = convertArgsForBackbone(args)
     args = convertArgsForTransformer(args)
+    
+    # Resolve epoch-0 scheduled hyperparameters so that builders
+    # (which expect scalar values) receive the correct initial values.
+    epoch0Params = resolveEpochParams(args, epoch=args.startEpoch)
+    for name, value in epoch0Params.items():
+        setattr(args, f'_current_{name}', value)
+    logEpochScheduledParams(vidDetrLogger, args.startEpoch, epoch0Params)
     
     # Build datasets FIRST so that dataset-driven numClasses is set
     # before the model and criterion are constructed.
@@ -547,10 +638,24 @@ def main(args):
         if args.distributed:
             samplerTrain.set_epoch(epoch)
         
+        # ---- Resolve per-epoch scheduled hyperparameters ----
+        epochParams = resolveEpochParams(args, epoch)
+        logEpochScheduledParams(vidDetrLogger, epoch, epochParams)
+        
+        # Update criterion (loss weights, focal params, contrastive temp, etc.)
+        criterion.updateEpochParams(epochParams)
+        
+        # Update model (denoising noise ratios, dropout, etc.)
+        rawModel = model.module if hasattr(model, 'module') else model
+        rawModel.updateEpochParams(epochParams)
+        
+        # Resolve clipMaxNorm for this epoch (engine needs it as scalar)
+        currentClipMaxNorm = epochParams['clipMaxNorm']
+        
         # Train one epoch
         trainStats = trainOneEpoch(
             model, criterion, dataLoaderTrain,
-            optimizer, device, epoch, args.clipMaxNorm,
+            optimizer, device, epoch, currentClipMaxNorm,
             accumSteps=args.accumSteps,
             tracker=trainTracker,
             emaModel=emaModel,

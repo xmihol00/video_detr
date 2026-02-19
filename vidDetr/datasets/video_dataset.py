@@ -66,6 +66,10 @@ class VideoSequenceDataset(Dataset):
         maxFrameGap: Maximum gap between sampled frames (default: 10)
         classNames: Optional list of class names
         useCache: Whether to use cached sequence information (default: True)
+        minBoxSize: Minimum GT box size as a fraction of image width or
+                    height.  Boxes whose normalised width **and** height
+                    are both smaller than this value are dropped.
+                    Set to 0.0 to keep all boxes.  Default: 0.0.
     """
     
     # Regex pattern for parsing filenames: seq_XXXXXX_frame_XXXX
@@ -81,7 +85,8 @@ class VideoSequenceDataset(Dataset):
         minFrameGap: int = 1,
         maxFrameGap: int = 10,
         classNames: Optional[List[str]] = None,
-        useCache: bool = True
+        useCache: bool = True,
+        minBoxSize: float = 0.0,
     ):
         super().__init__()
         
@@ -94,6 +99,7 @@ class VideoSequenceDataset(Dataset):
         self.maxFrameGap = maxFrameGap
         self.classNames = classNames
         self.useCache = useCache
+        self.minBoxSize = minBoxSize
         
         # Paths to images and labels directories
         self.imagesDir = self.dataRoot / 'images'
@@ -362,6 +368,10 @@ class VideoSequenceDataset(Dataset):
                     if not (0 <= cx <= 1 and 0 <= cy <= 1 and 0 < w <= 1 and 0 < h <= 1):
                         continue
                     
+                    # Skip boxes that are too small (both w and h below threshold)
+                    if self.minBoxSize > 0 and w < self.minBoxSize and h < self.minBoxSize:
+                        continue
+                    
                     boxes.append([cx, cy, w, h])
                     labels.append(classId)
                     trackIds.append(lineIdx)  # Line number = track ID
@@ -618,6 +628,8 @@ def buildVideoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
     # Build datasets
     trainTransforms = makeVideoTransforms('train', maxSize=args.maxSize)
     
+    minBoxSize = getattr(args, 'minBoxSize', 0.0)
+    
     trainDataset = VideoSequenceDataset(
         dataRoot=trainRoot,
         numFrames=args.numFrames,
@@ -626,7 +638,8 @@ def buildVideoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
         framesPerSequence=args.framesPerSequence,
         minFrameGap=args.minFrameGap,
         maxFrameGap=args.maxFrameGap,
-        classNames=classNames
+        classNames=classNames,
+        minBoxSize=minBoxSize,
     )
     
     if mergeTrainVal:
@@ -640,7 +653,8 @@ def buildVideoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
             framesPerSequence=args.framesPerSequence,
             minFrameGap=args.minFrameGap,
             maxFrameGap=args.maxFrameGap,
-            classNames=classNames
+            classNames=classNames,
+            minBoxSize=minBoxSize,
         )
         merged = torch.utils.data.ConcatDataset([trainDataset, valAsTrainDataset])
         print(
@@ -659,7 +673,8 @@ def buildVideoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
         framesPerSequence=args.framesPerSequence,
         minFrameGap=args.minFrameGap,
         maxFrameGap=args.maxFrameGap,
-        classNames=classNames
+        classNames=classNames,
+        minBoxSize=minBoxSize,
     )
     
     return trainDataset, valDataset

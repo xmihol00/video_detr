@@ -54,6 +54,10 @@ class SupervisedContrastiveLoss(nn.Module):
         self.baseLossWeight = baseLossWeight
         self.contrastAllFrames = contrastAllFrames
     
+    def updateTemperature(self, temperature: float) -> None:
+        """Update the temperature parameter (for per-epoch scheduling)."""
+        self.temperature = temperature
+    
     def forward(
         self,
         embeddings: Tensor,

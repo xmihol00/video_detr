@@ -210,6 +210,41 @@ class VideoDETR(nn.Module):
         
         return queries
     
+    def updateEpochParams(self, params: dict) -> None:
+        """
+        Update model hyperparameters for the current epoch.
+
+        Propagates per-epoch scheduled values to sub-modules
+        (denoising generator, dropout layers, etc.).
+
+        Args:
+            params: Dict mapping parameter names to scalar values.
+                    Recognised keys: ``labelNoiseRatio``, ``boxNoiseScale``,
+                    ``dropout``, ``dropPathRate``.
+        """
+        # Update denoising generator noise parameters
+        if self.denoisingGenerator is not None:
+            self.denoisingGenerator.updateEpochParams(params)
+
+        # Update head dropout
+        newDropout = params.get('dropout', None)
+        if newDropout is not None and hasattr(self, 'headDropoutLayer'):
+            if isinstance(self.headDropoutLayer, nn.Dropout):
+                self.headDropoutLayer.p = newDropout
+            elif newDropout > 0:
+                self.headDropoutLayer = nn.Dropout(newDropout)
+
+        # Update MLP dropouts in bboxEmbed
+        if newDropout is not None and hasattr(self.bboxEmbed, 'dropouts') and self.bboxEmbed.dropouts is not None:
+            for d in self.bboxEmbed.dropouts:
+                d.p = newDropout
+
+        # Update tracking head dropout layers (embedded in nn.Sequential)
+        if newDropout is not None and hasattr(self.trackingHead, 'mlp'):
+            for layer in self.trackingHead.mlp:
+                if isinstance(layer, nn.Dropout):
+                    layer.p = newDropout
+
     def freezeBackbone(self, freeze: bool = True):
         """Freeze or unfreeze backbone parameters."""
         print(f"{'Freezing' if freeze else 'Unfreezing'} backbone parameters.")
@@ -451,11 +486,21 @@ def buildVideoDETR(args) -> Tuple[VideoDETR, nn.Module, Dict[str, nn.Module]]:
     Build VideoDETR model, criterion, and postprocessors from args.
     
     Args:
-        args: Argument namespace with model configuration
+        args: Argument namespace with model configuration.
+              Scheduled hyperparameters may be lists; the first element
+              is used for initial construction.
         
     Returns:
         Tuple of (model, criterion, postprocessors)
     """
+    def _first(val, default=None):
+        """Return the first element if *val* is a list, else *val* itself."""
+        if val is None:
+            return default
+        if isinstance(val, list):
+            return val[0] if val else default
+        return val
+
     # Import criterion builder
     from vidDetr.losses import buildVideoCriterion
     from vidDetr.losses.video_criterion import PostProcess
@@ -478,11 +523,11 @@ def buildVideoDETR(args) -> Tuple[VideoDETR, nn.Module, Dict[str, nn.Module]]:
         auxLoss=args.auxLoss,
         trackingEmbedDim=getattr(args, 'trackingEmbedDim', 128),
         temporalType=getattr(args, 'temporalEncoding', 'learned'),
-        headDropout=getattr(args, 'dropout', 0.1),
+        headDropout=_first(getattr(args, 'dropout', 0.1), 0.1),
         useDnDenoising=getattr(args, 'useDnDenoising', True),
         numDnGroups=getattr(args, 'numDnGroups', 5),
-        labelNoiseRatio=getattr(args, 'labelNoiseRatio', 0.5),
-        boxNoiseScale=getattr(args, 'boxNoiseScale', 0.4)
+        labelNoiseRatio=_first(getattr(args, 'labelNoiseRatio', 0.5), 0.5),
+        boxNoiseScale=_first(getattr(args, 'boxNoiseScale', 0.4), 0.4)
     )
     
     # Build criterion

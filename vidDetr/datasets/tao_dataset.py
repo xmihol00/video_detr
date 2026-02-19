@@ -83,6 +83,10 @@ class TaoDataset(Dataset):
         useCache:           Cache the parsed annotation index to disk.
         maxCategoriesUsed:  If set, keep only the N most frequent categories
                             (by annotation count).  ``None`` keeps all.
+        minBoxSize:         Minimum GT box size as a fraction of image width
+                            or height.  Boxes whose normalised width **and**
+                            height are both smaller than this value are
+                            dropped.  Set to 0.0 to keep all.  Default: 0.0.
     """
 
     def __init__(
@@ -97,6 +101,7 @@ class TaoDataset(Dataset):
         windowOverlap: float = 0.5,
         useCache: bool = True,
         maxCategoriesUsed: Optional[int] = None,
+        minBoxSize: float = 0.0,
     ):
         super().__init__()
 
@@ -110,6 +115,7 @@ class TaoDataset(Dataset):
         self.windowOverlap = windowOverlap
         self.useCache = useCache
         self.maxCategoriesUsed = maxCategoriesUsed
+        self.minBoxSize = minBoxSize
 
         # ── Parse annotations ─────────────────────────────────────────
         annData = self._loadAnnotations()
@@ -391,6 +397,13 @@ class TaoDataset(Dataset):
             if w <= 0 or h <= 0:
                 continue
 
+            # Skip boxes that are too small (both normalised w and h below threshold)
+            if self.minBoxSize > 0:
+                normW = w / imgWidth
+                normH = h / imgHeight
+                if normW < self.minBoxSize and normH < self.minBoxSize:
+                    continue
+
             # Convert to xyxy (absolute pixels)
             x1 = max(0.0, x)
             y1 = max(0.0, y)
@@ -576,6 +589,7 @@ def buildTaoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
     maxCat = getattr(args, "taoMaxCategories", None)
     maxSize = getattr(args, "maxSize", 800)
     mergeTrainVal = getattr(args, "mergeTrainVal", False)
+    minBoxSize = getattr(args, "minBoxSize", 0.0)
 
     datasetTrain = TaoDataset(
         dataRoot=str(root),
@@ -587,6 +601,7 @@ def buildTaoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
         maxFrameGap=getattr(args, "maxFrameGap", 10),
         windowOverlap=getattr(args, "taoWindowOverlap", 0.5),
         maxCategoriesUsed=maxCat,
+        minBoxSize=minBoxSize,
     )
 
     if mergeTrainVal:
@@ -602,6 +617,7 @@ def buildTaoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
             maxFrameGap=getattr(args, "maxFrameGap", 10),
             windowOverlap=getattr(args, "taoWindowOverlap", 0.5),
             maxCategoriesUsed=maxCat,
+            minBoxSize=minBoxSize,
         )
 
         assert datasetTrain.numClasses == datasetValAsTrain.numClasses, (
@@ -628,6 +644,7 @@ def buildTaoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
         maxFrameGap=getattr(args, "maxFrameGap", 10),
         windowOverlap=0.0,  # no overlap for validation
         maxCategoriesUsed=maxCat,
+        minBoxSize=minBoxSize,
     )
 
     # Synchronise numClasses so the model and criterion agree
