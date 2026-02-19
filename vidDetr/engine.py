@@ -22,10 +22,13 @@ if str(_parentDir) not in sys.path:
 import logging
 import math
 import os
+import random as pyrandom
 import time
 import copy
 from typing import Any, Dict, Iterable, List, Optional
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -95,6 +98,169 @@ class ModelEMA:
                 emaParam.mul_(self.decay).add_(modelParam, alpha=1.0 - self.decay)
 
 
+# ── ImageNet constants for denormalisation ────────────────────────────
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _denormalize(tensor: torch.Tensor) -> np.ndarray:
+    """Convert a normalised [3, H, W] image tensor to a BGR uint8 ndarray."""
+    img = tensor.detach().cpu().float().numpy()            # [3, H, W]
+    img = img.transpose(1, 2, 0)                           # [H, W, 3] RGB
+    img = img * _IMAGENET_STD + _IMAGENET_MEAN             # undo normalise
+    img = np.clip(img * 255, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+
+def _cxcywhToXyxy(boxes: np.ndarray, imgW: int, imgH: int) -> np.ndarray:
+    """Normalised cxcywh (0-1) → absolute xyxy pixel coords."""
+    if len(boxes) == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+    cx = boxes[:, 0] * imgW
+    cy = boxes[:, 1] * imgH
+    bw = boxes[:, 2] * imgW
+    bh = boxes[:, 3] * imgH
+    x1 = cx - bw / 2
+    y1 = cy - bh / 2
+    x2 = cx + bw / 2
+    y2 = cy + bh / 2
+    return np.stack([x1, y1, x2, y2], axis=1)
+
+
+def _drawDashedRect(
+    img: np.ndarray,
+    pt1: tuple, pt2: tuple,
+    colour: tuple,
+    thickness: int = 2,
+    dashLen: int = 8,
+    gapLen: int = 5,
+):
+    """Draw a dashed rectangle."""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    for (sx, sy), (ex, ey) in [
+        ((x1, y1), (x2, y1)),
+        ((x2, y1), (x2, y2)),
+        ((x2, y2), (x1, y2)),
+        ((x1, y2), (x1, y1)),
+    ]:
+        length = max(abs(ex - sx), abs(ey - sy))
+        if length == 0:
+            continue
+        dx, dy = (ex - sx) / length, (ey - sy) / length
+        drawn, draw = 0, True
+        while drawn < length:
+            seg = dashLen if draw else gapLen
+            segEnd = min(drawn + seg, length)
+            if draw:
+                p1 = (int(sx + dx * drawn), int(sy + dy * drawn))
+                p2 = (int(sx + dx * segEnd), int(sy + dy * segEnd))
+                cv2.line(img, p1, p2, colour, thickness, cv2.LINE_AA)
+            drawn = segEnd
+            draw = not draw
+
+
+def saveDebugFrame(
+    samples: List,
+    targets: List[List[Dict]],
+    outputs: Dict[str, torch.Tensor],
+    epoch: int,
+    batchIdx: int,
+    debugDir: str,
+    queriesPerFrame: int,
+    confidence: float = 0.3,
+    useFocalLoss: bool = False,
+) -> None:
+    """
+    Pick one random sample & frame from the batch, draw GT (green dashed)
+    and predicted (red solid) boxes, and save to *debugDir*.
+
+    Args:
+        samples:  list of N NestedTensors, each [B, 3, H, W]
+        targets:  list of N lists of B target dicts
+        outputs:  model output dict with ``pred_logits`` [B, Q, C+1]
+                  and ``pred_boxes`` [B, Q, 4]
+        epoch:    current epoch number
+        batchIdx: current batch index
+        debugDir: path to the debug_frames/ directory
+        queriesPerFrame: number of queries per frame
+        confidence: minimum score to draw a predicted box
+        useFocalLoss: if True, use sigmoid (multi-label) instead of softmax
+    """
+    try:
+        numFrames = len(samples)
+        batchSize = samples[0].tensors.shape[0]
+
+        # Pick a random sample and frame
+        sampleIdx = pyrandom.randint(0, batchSize - 1)
+        frameIdx  = pyrandom.randint(0, numFrames - 1)
+
+        # ── Recover image ─────────────────────────────────────────
+        imgTensor = samples[frameIdx].tensors[sampleIdx]   # [3, H, W]
+        bgr = _denormalize(imgTensor)
+        imgH, imgW = bgr.shape[:2]
+
+        # ── GT boxes (green, dashed) ─────────────────────────────
+        tgt = targets[frameIdx][sampleIdx]
+        gtBoxesCxcywh = tgt["boxes"].detach().cpu().numpy()   # normalised
+        gtLabels = tgt["labels"].detach().cpu().numpy()
+        gtXyxy = _cxcywhToXyxy(gtBoxesCxcywh, imgW, imgH)
+
+        for i in range(len(gtXyxy)):
+            x1, y1, x2, y2 = gtXyxy[i].astype(int)
+            _drawDashedRect(bgr, (x1, y1), (x2, y2), (0, 220, 0), 2)
+            label = f"GT c{int(gtLabels[i])}"
+            cv2.putText(bgr, label, (x1, max(y1 - 4, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 220, 0), 1,
+                        cv2.LINE_AA)
+
+        # ── Predicted boxes (red, solid) ─────────────────────────
+        qStart = frameIdx * queriesPerFrame
+        qEnd   = qStart + queriesPerFrame
+
+        predLogits = outputs["pred_logits"][sampleIdx, qStart:qEnd]  # [Q, C+1]
+        predBoxes  = outputs["pred_boxes"][sampleIdx, qStart:qEnd]   # [Q, 4]
+
+        if useFocalLoss:
+            # Focal loss → sigmoid per class; last dim is also a class
+            # (no dedicated no-object class), take max over all C+1 dims.
+            probs = predLogits.detach().sigmoid().cpu().numpy()  # [Q, C+1]
+        else:
+            # Cross-entropy → softmax; last dim = no-object, strip it
+            probs = predLogits.detach().softmax(-1)[:, :-1].cpu().numpy()  # [Q, C]
+        maxScores = probs.max(axis=1)
+        maxLabels = probs.argmax(axis=1)
+
+        predBoxesNp = predBoxes.detach().cpu().numpy()
+        predXyxy = _cxcywhToXyxy(predBoxesNp, imgW, imgH)
+
+        for i in range(len(predXyxy)):
+            if maxScores[i] < confidence:
+                continue
+            x1, y1, x2, y2 = predXyxy[i].astype(int)
+            cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 0, 230), 2, cv2.LINE_AA)
+            label = f"c{int(maxLabels[i])} {maxScores[i]:.2f}"
+            cv2.putText(bgr, label, (x1, max(y2 + 14, 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 230), 1,
+                        cv2.LINE_AA)
+
+        # ── HUD ──────────────────────────────────────────────────
+        numGt = len(gtXyxy)
+        numPred = int((maxScores >= confidence).sum())
+        hud = (f"epoch {epoch}  batch {batchIdx}  "
+               f"sample {sampleIdx}  frame {frameIdx}  "
+               f"GT: {numGt}  pred: {numPred}")
+        cv2.putText(bgr, hud, (6, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1,
+                    cv2.LINE_AA)
+
+        # ── Save ─────────────────────────────────────────────────
+        outPath = os.path.join(debugDir, f"epoch_{epoch:03d}_batch_{batchIdx:05d}.jpg")
+        cv2.imwrite(outPath, bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    except Exception as e:
+        logger.warning("Failed to save debug frame: %s", e)
+
+
 def trainOneEpoch(
     model: nn.Module,
     criterion: nn.Module,
@@ -106,6 +272,7 @@ def trainOneEpoch(
     accumSteps: int = 1,
     tracker: Optional[MetricTracker] = None,
     emaModel: Optional[ModelEMA] = None,
+    debugFramesDir: Optional[str] = None,
 ) -> Dict[str, float]:
     """
     Train for one epoch.
@@ -121,6 +288,7 @@ def trainOneEpoch(
         accumSteps: Number of gradient accumulation steps
         tracker: Optional MetricTracker for CSV logging
         emaModel: Optional EMA model to update after each optimizer step
+        debugFramesDir: If set, save one debug frame per batch to this dir
 
     Returns:
         Dict of mean metrics for the epoch
@@ -158,6 +326,16 @@ def trainOneEpoch(
 
         # Forward pass (pass targets for label denoising during training)
         outputs = model(samples, targets=targets)
+
+        # Save debug visualisation frame (GT vs predictions)
+        if debugFramesDir is not None:
+            rawModel = model.module if hasattr(model, 'module') else model
+            saveDebugFrame(
+                samples, targets, outputs,
+                epoch, batchIdx, debugFramesDir,
+                queriesPerFrame=rawModel.queriesPerFrame,
+                useFocalLoss=criterion.useFocalLoss,
+            )
 
         # Compute losses
         lossDict = criterion(outputs, targets)
@@ -242,13 +420,12 @@ def trainOneEpoch(
             lossDetails = _formatNonAuxLosses(lossDictReducedScaled)
 
             logger.info(
-                "Epoch [%d] [%d/%d]  loss: %.4f  lr: %.6f  "
+                "Epoch [%d] [%d/%d]  loss: %.4f  "
                 "class_err: %.2f  %s%s",
                 epoch,
                 batchIdx,
                 totalBatches,
                 batchLoss,
-                currentLr,
                 batchMetrics.get("class_error", 0.0),
                 lossDetails,
                 memStr,

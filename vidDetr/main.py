@@ -26,6 +26,7 @@ if str(_parentDir) not in sys.path:
 
 import argparse
 import datetime
+import os
 import random
 import time
 from typing import Dict, Optional
@@ -88,13 +89,13 @@ def getArgsParser():
                         help='Gradient clipping max norm')
     
     # Warmup parameters
-    parser.add_argument('--warmupEpochs', default=0, type=int,
+    parser.add_argument('--warmupEpochs', default=2, type=int,
                         help='Number of warmup epochs with linearly increasing LR')
     parser.add_argument('--warmupStartLr', default=1e-6, type=float,
                         help='Starting learning rate for warmup')
     
     # Gradient accumulation
-    parser.add_argument('--accumSteps', default=4, type=int,
+    parser.add_argument('--accumSteps', default=1, type=int,
                         help='Gradient accumulation steps (effective batch = batchSize * accumSteps)')
     
     # Model parameters
@@ -102,12 +103,12 @@ def getArgsParser():
                         help='CNN backbone architecture')
     parser.add_argument('--freezeBackbone', action='store_true', default=False,
                         help='Freeze backbone parameters during training')
-    parser.add_argument('--dilation', action='store_true',
+    parser.add_argument('--dilation', action='store_true', default=False,
                         help='Use dilation in last backbone block')
     parser.add_argument('--positionEmbedding', default='sine', type=str,
                         choices=['sine', 'learned'],
                         help='Type of spatial positional embedding')
-    parser.add_argument('--temporalEncoding', default='learned', type=str,
+    parser.add_argument('--temporalEncoding', default='sine', type=str,
                         choices=['sine', 'learned'],
                         help='Type of temporal positional embedding')
     
@@ -130,11 +131,11 @@ def getArgsParser():
     # VideoDETR specific parameters
     parser.add_argument('--numFrames', default=4, type=int,
                         help='Number of frames per video clip')
-    parser.add_argument('--queriesPerFrame', default=50, type=int,
+    parser.add_argument('--queriesPerFrame', default=30, type=int,
                         help='Number of detection queries per frame')
     parser.add_argument('--trackingEmbedDim', default=128, type=int,
                         help='Dimension of tracking embeddings')
-    parser.add_argument('--maxFrames', default=100, type=int,
+    parser.add_argument('--maxFrames', default=50, type=int,
                         help='Maximum frames for temporal encoding')
     
     # Loss parameters
@@ -150,7 +151,7 @@ def getArgsParser():
                         help='Focal loss alpha (balancing factor)')
     parser.add_argument('--focalGamma', default=2.0, type=float,
                         help='Focal loss gamma (focusing parameter)')
-    parser.add_argument('--setCostClass', default=3.0, type=float,
+    parser.add_argument('--setCostClass', default=2.0, type=float,
                         help='Classification cost in matching')
     parser.add_argument('--setCostBbox', default=5.0, type=float,
                         help='L1 box cost in matching')
@@ -162,7 +163,7 @@ def getArgsParser():
                         help='GIoU loss coefficient')
     parser.add_argument('--eosCoef', default=0.05, type=float,
                         help='No-object class weight (higher = fewer false positives)')
-    parser.add_argument('--trackingLossCoef', default=2.0, type=float,
+    parser.add_argument('--trackingLossCoef', default=0.2, type=float,
                         help='Tracking contrastive loss coefficient')
     parser.add_argument('--contrastiveTemp', default=0.07, type=float,
                         help='Temperature for contrastive loss')
@@ -182,11 +183,11 @@ def getArgsParser():
                         help='Coefficient for denoising losses (multiplied with base loss coefs)')
     
     # Duplicate suppression loss
-    parser.add_argument('--dupLossCoef', default=0.65, type=float,
+    parser.add_argument('--dupLossCoef', default=0.0, type=float,
                         help='Weight for IoU-based duplicate suppression loss')
     
     # EMA (Exponential Moving Average)
-    parser.add_argument('--useEma', action='store_true', default=True,
+    parser.add_argument('--useEma', action='store_true', default=False,
                         help='Use EMA (exponential moving average) of model weights')
     parser.add_argument('--noEma', dest='useEma', action='store_false',
                         help='Disable EMA')
@@ -221,7 +222,7 @@ def getArgsParser():
                         help='Overlap fraction between TAO video windows (0-1)')
     
     # Merge train + val
-    parser.add_argument('--mergeTrainVal', action='store_true', default=True,
+    parser.add_argument('--mergeTrainVal', action='store_true', default=False,
                         help='Merge training and validation sets into one training set '
                              '(no validation loop; a checkpoint is saved every epoch)')
     
@@ -230,7 +231,7 @@ def getArgsParser():
                         help='Directory to save checkpoints')
     parser.add_argument('--device', default='cuda',
                         help='Device for training')
-    parser.add_argument('--seed', default=1, type=int,
+    parser.add_argument('--seed', default=random.randint(0, 22**32-1), type=int,
                         help='Random seed')
     parser.add_argument('--resume', default='', type=str,
                         help='Path to checkpoint to resume from')
@@ -241,6 +242,11 @@ def getArgsParser():
     parser.add_argument('--numWorkers', default=4, type=int,
                         help='Number of dataloader workers')
     
+    # Debug visualisation
+    parser.add_argument('--debugFrames', action='store_true', default=True,
+                        help='Save one debug frame per batch to debug_frames/ '
+                             '(GT green dashed, predictions red solid)')
+    
     # Distributed training
     parser.add_argument('--worldSize', default=NUM_GPUS, type=int,
                         help='Number of distributed processes')
@@ -248,7 +254,7 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    #parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/vidDetr_weights/video_detr_003.pth', type=str,
+    #parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-02-19/checkpoint_latest.pth', type=str,
     #                    help='Path to pretrained DETR weights')
     parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
                     help='Path to pretrained DETR weights')
@@ -523,6 +529,13 @@ def main(args):
     trainTracker = MetricTracker(outputDir=args.outputDir, phase="train")
     valTracker = MetricTracker(outputDir=args.outputDir, phase="val") if dataLoaderVal is not None else None
 
+    # Debug frames directory
+    debugFramesDir = None
+    if getattr(args, 'debugFrames', False):
+        debugFramesDir = str(outputDir / 'debug_frames')
+        os.makedirs(debugFramesDir, exist_ok=True)
+        vidDetrLogger.info("Debug frames enabled → %s", debugFramesDir)
+
     # Training loop
     vidDetrLogger.info("Starting training...")
     if mergeTrainVal:
@@ -541,6 +554,7 @@ def main(args):
             accumSteps=args.accumSteps,
             tracker=trainTracker,
             emaModel=emaModel,
+            debugFramesDir=debugFramesDir,
         )
         
         lrScheduler.step()

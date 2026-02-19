@@ -67,7 +67,7 @@ def getArgsParser() -> argparse.ArgumentParser:
     # Required
     parser.add_argument(
         "--modelPath",
-        default="video_detr_best.pth",
+        default="checkpoint_latest.pth",
         type=str,
         help="Path to a VideoDETR checkpoint (.pth)",
     )

@@ -300,14 +300,29 @@ class VideoCriterion(nn.Module):
                 targetClasses[batchIdx, globalSrcIdx] = tgtLabels.to(device)
         
         if self.useFocalLoss:
-            # Focal loss: operates on one-hot targets with sigmoid
-            # srcLogits shape: [B, numQueries, numClasses+1]
-            # Build one-hot targets of same shape
-            targetClassesOnehot = torch.zeros_like(srcLogits)
-            targetClassesOnehot.scatter_(2, targetClasses.unsqueeze(-1), 1)
-            
+            # Focal loss: sigmoid per class (multi-label style).
+            # Only operate on the first numClasses logits — the last dim
+            # (no-object) is NOT used with focal loss; background queries
+            # are represented by all-zeros one-hot (every sigmoid low).
+            srcLogitsFocal = srcLogits[:, :, :self.numClasses]  # [B, Q, C]
+
+            targetClassesOnehot = torch.zeros(
+                srcLogitsFocal.shape, dtype=srcLogitsFocal.dtype,
+                device=device,
+            )
+            # Only matched queries get a 1 at their true class;
+            # unmatched queries keep all-zeros (targetClasses == numClasses).
+            validMask = targetClasses < self.numClasses  # [B, Q]
+            validTargets = targetClasses.clone()
+            validTargets[~validMask] = 0  # placeholder so scatter doesn't OOB
+            targetClassesOnehot.scatter_(
+                2, validTargets.unsqueeze(-1), 1
+            )
+            # Zero out the incorrectly scattered placeholder positions
+            targetClassesOnehot[~validMask] = 0
+
             lossCe = sigmoidFocalLoss(
-                srcLogits, targetClassesOnehot, numBoxes,
+                srcLogitsFocal, targetClassesOnehot, numBoxes,
                 alpha=self.focalAlpha, gamma=self.focalGamma
             )
         else:
@@ -346,7 +361,7 @@ class VideoCriterion(nn.Module):
                 # For focal loss, class_error is computed on matched predictions only
                 if self.useFocalLoss:
                     # Get the logits of matched queries and compute accuracy
-                    predLogitsMatched = srcLogits[batchIdxCat, srcIdxCat]
+                    predLogitsMatched = srcLogits[batchIdxCat, srcIdxCat, :self.numClasses]
                     # With focal loss, predict = argmax of sigmoid
                     predClasses = predLogitsMatched.sigmoid().argmax(-1)
                     correctPreds = (predClasses == tgtLabelsCat).float().mean() * 100
@@ -577,8 +592,8 @@ class VideoCriterion(nn.Module):
         
         # Get objectness scores (probability of NOT being no-object)
         if self.useFocalLoss:
-            # sigmoid-based: max prob across real classes
-            objScores = outputs['pred_logits'].sigmoid().max(dim=-1).values
+            # sigmoid-based: max prob across real classes (exclude no-object dim)
+            objScores = outputs['pred_logits'][:, :, :self.numClasses].sigmoid().max(dim=-1).values
         else:
             # softmax-based: 1 - prob(no-object)
             probs = outputs['pred_logits'].softmax(dim=-1)
@@ -755,16 +770,28 @@ class VideoCriterion(nn.Module):
         
         # ---- Classification loss ----
         if self.useFocalLoss:
-            # Build one-hot targets
-            targetClassesOnehot = torch.zeros_like(dnPredLogits)
-            targetClassesOnehot.scatter_(2, knownLabels.unsqueeze(-1), 1)
+            # Only use first numClasses logits (no no-object dim for focal loss)
+            dnPredLogitsFocal = dnPredLogits[:, :, :self.numClasses]  # [B, totalDnQueries, C]
+            
+            # Build one-hot targets over C classes
+            targetClassesOnehot = torch.zeros(
+                dnPredLogitsFocal.shape, dtype=dnPredLogitsFocal.dtype,
+                layout=dnPredLogitsFocal.layout, device=dnPredLogitsFocal.device
+            )
+            # Only scatter valid labels that are within range
+            validLabelMask = validMask & (knownLabels < self.numClasses)
+            safeLabels = knownLabels.clone()
+            safeLabels[~validLabelMask] = 0
+            targetClassesOnehot.scatter_(2, safeLabels.unsqueeze(-1), 1)
+            # Zero-out rows where label was invalid or query is padded
+            targetClassesOnehot[~validLabelMask] = 0
             
             # Mask out invalid (padded) queries: set them to no-object
             # For invalid queries, we zero-out the one-hot (all zeros = no-object for sigmoid)
             targetClassesOnehot = targetClassesOnehot * validMask.unsqueeze(-1).float()
             
             lossDnCe = sigmoidFocalLoss(
-                dnPredLogits, targetClassesOnehot, numBoxes,
+                dnPredLogitsFocal, targetClassesOnehot, numBoxes,
                 alpha=self.focalAlpha, gamma=self.focalGamma
             )
         else:
