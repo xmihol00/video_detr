@@ -144,7 +144,7 @@ def getArgsParser():
                         help='Base learning rate')
     parser.add_argument('--lrBackbone', default=1e-5, type=float,
                         help='Learning rate for backbone')
-    parser.add_argument('--batchSize', default=48, type=int,
+    parser.add_argument('--batchSize', default=37, type=int,
                         help='Batch size per GPU')
     parser.add_argument('--weightDecay', default=1e-4, type=float,
                         help='Weight decay')
@@ -156,7 +156,7 @@ def getArgsParser():
                         help='Gradient clipping max norm; per-epoch schedule')
     
     # Warmup parameters
-    parser.add_argument('--warmupEpochs', default=2, type=int,
+    parser.add_argument('--warmupEpochs', default=0, type=int,
                         help='Number of warmup epochs with linearly increasing LR')
     parser.add_argument('--warmupStartLr', default=1e-6, type=float,
                         help='Starting learning rate for warmup')
@@ -188,7 +188,7 @@ def getArgsParser():
                         help='Feedforward dimension in transformer')
     parser.add_argument('--hiddenDim', default=256, type=int,
                         help='Transformer hidden dimension')
-    parser.add_argument('--dropout', default=[0.0, 0.1, 0.1, 0.2], nargs='+', type=float,
+    parser.add_argument('--dropout', default=[0.1, 0.1, 0.1, 0.15, 0.15, 0.15], nargs='+', type=float,
                         help='Dropout rate in transformer and heads; per-epoch schedule')
     parser.add_argument('--nheads', default=8, type=int,
                         help='Number of attention heads')
@@ -218,7 +218,7 @@ def getArgsParser():
                         help='Focal loss alpha (balancing factor); per-epoch schedule')
     parser.add_argument('--focalGamma', default=[2.0], nargs='+', type=float,
                         help='Focal loss gamma (focusing parameter); per-epoch schedule')
-    parser.add_argument('--setCostClass', default=[4.0, 3.75, 3.5, 3.0], nargs='+', type=float,
+    parser.add_argument('--setCostClass', default=[3.25], nargs='+', type=float,
                         help='Classification cost in matching; per-epoch schedule')
     parser.add_argument('--setCostBbox', default=[5.0], nargs='+', type=float,
                         help='L1 box cost in matching; per-epoch schedule')
@@ -228,9 +228,9 @@ def getArgsParser():
                         help='L1 box loss coefficient; per-epoch schedule')
     parser.add_argument('--giouLossCoef', default=[2.0], nargs='+', type=float,
                         help='GIoU loss coefficient; per-epoch schedule')
-    parser.add_argument('--eosCoef', default=[0.035, 0.05, 0.1, 0.15, 0.2], nargs='+', type=float,
+    parser.add_argument('--eosCoef', default=[0.1], nargs='+', type=float,
                         help='No-object class weight (higher = fewer false positives); per-epoch schedule')
-    parser.add_argument('--trackingLossCoef', default=[0.0, 0.05, 0.1, 0.25, 0.5, 0.75], nargs='+', type=float,
+    parser.add_argument('--trackingLossCoef', default=[0.0], nargs='+', type=float,
                         help='Tracking contrastive loss coefficient; per-epoch schedule')
     parser.add_argument('--contrastiveTemp', default=[0.07], nargs='+', type=float,
                         help='Temperature for contrastive loss; per-epoch schedule')
@@ -250,7 +250,7 @@ def getArgsParser():
                         help='Coefficient for denoising losses (multiplied with base loss coefs); per-epoch schedule')
     
     # Duplicate suppression loss
-    parser.add_argument('--dupLossCoef', default=[0.0, 0.1, 0.25, 0.5, 1.0, 1.5], nargs='+', type=float,
+    parser.add_argument('--dupLossCoef', default=[0.0, 0.0, 0.25, 0.25, 0.25, 0.5], nargs='+', type=float,
                         help='Weight for IoU-based duplicate suppression loss; per-epoch schedule')
     
     # EMA (Exponential Moving Average)
@@ -262,7 +262,7 @@ def getArgsParser():
                         help='EMA decay rate')
     
     # Drop path (stochastic depth)
-    parser.add_argument('--dropPathRate', default=[0.0, 0.025, 0.05, 0.075, 0.1], nargs='+', type=float,
+    parser.add_argument('--dropPathRate', default=[0.025, 0.05, 0.075, 0.1], nargs='+', type=float,
                         help='Drop path rate for stochastic depth regularization; per-epoch schedule')
     
     # Dataset parameters
@@ -278,7 +278,7 @@ def getArgsParser():
                         help='Maximum gap between sampled frames')
     parser.add_argument('--maxSize', default=384, type=int,
                         help='Maximum image size after transforms')
-    parser.add_argument('--minBoxSize', default=0.2, type=float,
+    parser.add_argument('--minBoxSize', default=0.00, type=float,
                         help='Minimum GT box size as fraction of image width or height; '
                              'boxes whose normalised w AND h are both below this threshold are dropped')
     
@@ -324,10 +324,20 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-02-19/checkpoint_latest.pth', type=str,
+    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-02-24/video_detr_best.pth', type=str,
                         help='Path to pretrained DETR weights')
     #parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
     #                help='Path to pretrained DETR weights')
+    
+    # Freeze pretrained weights
+    parser.add_argument('--freezePretrained', action='store_true', default=False,
+                        help='Freeze all weights loaded from pretrained model so that '
+                             'only newly initialised parameters are trained initially')
+    parser.add_argument('--noFreezePretrained', dest='freezePretrained', action='store_false',
+                        help='Disable freezing of pretrained weights')
+    parser.add_argument('--unfreezeAfterEpochs', default=5, type=int,
+                        help='Number of epochs after which frozen pretrained weights '
+                             'are unfrozen and full training resumes (default: 3)')
     
     return parser
 
@@ -373,6 +383,77 @@ def convertArgsForTransformer(args):
         args._dropoutSchedule = [args.dropout]
     
     return args
+
+
+def buildOptimizerAndScheduler(args, modelWithoutDdp, logger=None):
+    """
+    Build optimizer and LR scheduler for the given model.
+
+    Only parameters with ``requires_grad=True`` are included.  Two param
+    groups are created: backbone parameters (with ``args.lrBackbone``)
+    and everything else (with ``args.lr``).
+
+    Args:
+        args: Parsed command-line arguments.
+        modelWithoutDdp: The unwrapped model (not DistributedDataParallel).
+        logger: Optional logger for informational messages.
+
+    Returns:
+        Tuple of (optimizer, lrScheduler).
+    """
+    paramDicts = [
+        {
+            "params": [
+                p for n, p in modelWithoutDdp.named_parameters()
+                if "backbone" not in n and p.requires_grad
+            ],
+        },
+        {
+            "params": [
+                p for n, p in modelWithoutDdp.named_parameters()
+                if "backbone" in n and p.requires_grad
+            ],
+            "lr": args.lrBackbone,
+        },
+    ]
+
+    optimizer = torch.optim.AdamW(
+        paramDicts,
+        lr=args.lr,
+        weight_decay=args.weightDecay,
+    )
+
+    # Learning rate scheduler: warmup + step decay
+    stepScheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lrDrop)
+
+    if args.warmupEpochs > 0:
+        warmupStartFactor = args.warmupStartLr / args.lr
+        warmupScheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=warmupStartFactor,
+            end_factor=1.0,
+            total_iters=args.warmupEpochs,
+        )
+        lrScheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmupScheduler, stepScheduler],
+            milestones=[args.warmupEpochs],
+        )
+    else:
+        lrScheduler = stepScheduler
+
+    if logger is not None:
+        nTrainable = sum(
+            p.numel() for p in modelWithoutDdp.parameters() if p.requires_grad
+        )
+        logger.info("Optimizer: AdamW, lr=%s, lr_backbone=%s", args.lr, args.lrBackbone)
+        logger.info(
+            "LR schedule: warmup %d epochs (%s -> %s), step drop at epoch %d",
+            args.warmupEpochs, args.warmupStartLr, args.lr, args.lrDrop,
+        )
+        logger.info("Trainable parameters in this optimizer: %s", f"{nTrainable:,}")
+
+    return optimizer, lrScheduler
 
 
 def main(args):
@@ -460,54 +541,8 @@ def main(args):
         )
     
     # Setup optimizer with different learning rates
-    paramDicts = [
-        {
-            "params": [
-                p for n, p in modelWithoutDdp.named_parameters()
-                if "backbone" not in n and p.requires_grad
-            ]
-        },
-        {
-            "params": [
-                p for n, p in modelWithoutDdp.named_parameters()
-                if "backbone" in n and p.requires_grad
-            ],
-            "lr": args.lrBackbone,
-        },
-    ]
-    
-    optimizer = torch.optim.AdamW(
-        paramDicts,
-        lr=args.lr,
-        weight_decay=args.weightDecay
-    )
-    
-    # Learning rate scheduler: warmup + step decay
-    # StepLR handles the main schedule (drop at lrDrop)
-    stepScheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lrDrop)
-    
-    # Warmup scheduler (linear warmup over warmupEpochs)
-    if args.warmupEpochs > 0:
-        # Compute warmup factor: start from warmupStartLr / lr and linearly go to 1.0
-        warmupStartFactor = args.warmupStartLr / args.lr
-        warmupScheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=warmupStartFactor,
-            end_factor=1.0,
-            total_iters=args.warmupEpochs
-        )
-        lrScheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmupScheduler, stepScheduler],
-            milestones=[args.warmupEpochs]
-        )
-    else:
-        lrScheduler = stepScheduler
-    
-    vidDetrLogger.info("Optimizer: AdamW, lr=%s, lr_backbone=%s", args.lr, args.lrBackbone)
-    vidDetrLogger.info(
-        "LR schedule: warmup %d epochs (%s -> %s), step drop at epoch %d",
-        args.warmupEpochs, args.warmupStartLr, args.lr, args.lrDrop,
+    optimizer, lrScheduler = buildOptimizerAndScheduler(
+        args, modelWithoutDdp, logger=vidDetrLogger,
     )
     vidDetrLogger.info(
         "Gradient accumulation: %d steps (effective batch size = %d)",
@@ -577,6 +612,25 @@ def main(args):
         modelDict.update(pretrainedDict)
         modelWithoutDdp.load_state_dict(modelDict, strict=False)
         vidDetrLogger.info("Loaded %d/%d pretrained weights", len(pretrainedDict), len(checkpoint['model']))
+
+        # ---- Freeze pretrained parameters ----
+        if getattr(args, 'freezePretrained', False):
+            pretrainedParamNames = set(pretrainedDict.keys())
+            numFrozen = 0
+            for name, param in modelWithoutDdp.named_parameters():
+                if name in pretrainedParamNames:
+                    param.requires_grad = False
+                    numFrozen += 1
+            # Store the set of frozen param names so we can unfreeze later
+            args._frozenPretrainedNames = pretrainedParamNames
+            vidDetrLogger.info(
+                "Froze %d pretrained parameters (will unfreeze after epoch %d)",
+                numFrozen, args.unfreezeAfterEpochs - 1,
+            )
+            # Rebuild optimizer to only contain trainable parameters
+            optimizer, lrScheduler = buildOptimizerAndScheduler(
+                args, modelWithoutDdp, logger=vidDetrLogger,
+            )
     
     # Resume from checkpoint
     bestMetric = float('inf')  # Initialize best metric tracker
@@ -598,6 +652,29 @@ def main(args):
         if emaModel is not None and 'ema_state_dict' in checkpoint:
             emaModel.module.load_state_dict(checkpoint['ema_state_dict'])
             vidDetrLogger.info("Restored EMA state")
+        
+        # Restore frozen pretrained parameter names if resuming mid-freeze
+        if 'frozen_pretrained_names' in checkpoint:
+            frozenSet = set(checkpoint['frozen_pretrained_names'])
+            args._frozenPretrainedNames = frozenSet
+            # Re-freeze the parameters that were frozen before
+            numFrozen = 0
+            for name, param in modelWithoutDdp.named_parameters():
+                if name in frozenSet:
+                    param.requires_grad = False
+                    numFrozen += 1
+            vidDetrLogger.info(
+                "Restored %d frozen pretrained params from checkpoint",
+                numFrozen,
+            )
+            # Rebuild optimizer to exclude frozen params
+            optimizer, lrScheduler = buildOptimizerAndScheduler(
+                args, modelWithoutDdp, logger=vidDetrLogger,
+            )
+            # Restore scheduler state on the new scheduler
+            # (advance it to the resumed epoch)
+            for _ in range(args.startEpoch):
+                lrScheduler.step()
     
     # Evaluation only
     if args.eval:
@@ -637,7 +714,29 @@ def main(args):
     for epoch in range(args.startEpoch, args.epochs):
         if args.distributed:
             samplerTrain.set_epoch(epoch)
-        
+
+        # ---- Unfreeze pretrained weights after warm-up epochs ----
+        frozenNames = getattr(args, '_frozenPretrainedNames', None)
+        if frozenNames is not None and epoch == args.unfreezeAfterEpochs:
+            numUnfrozen = 0
+            for name, param in modelWithoutDdp.named_parameters():
+                if name in frozenNames and not param.requires_grad:
+                    param.requires_grad = True
+                    numUnfrozen += 1
+            args._frozenPretrainedNames = None  # prevent re-triggering
+            vidDetrLogger.info(
+                "Unfroze %d pretrained parameters at epoch %d — "
+                "rebuilding optimizer for full training",
+                numUnfrozen, epoch,
+            )
+            # Rebuild optimizer & scheduler so all params are optimised
+            optimizer, lrScheduler = buildOptimizerAndScheduler(
+                args, modelWithoutDdp, logger=vidDetrLogger,
+            )
+            # Advance the new scheduler to the current epoch
+            for _ in range(epoch):
+                lrScheduler.step()
+
         # ---- Resolve per-epoch scheduled hyperparameters ----
         epochParams = resolveEpochParams(args, epoch)
         logEpochScheduledParams(vidDetrLogger, epoch, epochParams)
@@ -709,6 +808,11 @@ def main(args):
             # Include EMA state in checkpoint
             if emaModel is not None:
                 checkpoint_data['ema_state_dict'] = emaModel.module.state_dict()
+            
+            # Include frozen pretrained param names for correct resume
+            frozenNames = getattr(args, '_frozenPretrainedNames', None)
+            if frozenNames is not None:
+                checkpoint_data['frozen_pretrained_names'] = list(frozenNames)
             
             for checkpointPath in checkpointPaths:
                 utils.save_on_master(checkpoint_data, checkpointPath)

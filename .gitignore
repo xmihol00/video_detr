@@ -20,3 +20,4 @@ test/
 tao_dataset_evaluation
 gt_vs_pred/
 debug_frames
+picked_images
