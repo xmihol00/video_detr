@@ -144,7 +144,7 @@ def getArgsParser():
                         help='Base learning rate')
     parser.add_argument('--lrBackbone', default=1e-5, type=float,
                         help='Learning rate for backbone')
-    parser.add_argument('--batchSize', default=37, type=int,
+    parser.add_argument('--batchSize', default=32, type=int,
                         help='Batch size per GPU')
     parser.add_argument('--weightDecay', default=1e-4, type=float,
                         help='Weight decay')
@@ -202,6 +202,11 @@ def getArgsParser():
                         help='Number of detection queries per frame')
     parser.add_argument('--trackingEmbedDim', default=128, type=int,
                         help='Dimension of tracking embeddings')
+    parser.add_argument('--numTrackingDecLayers', default=1, type=int,
+                        help='Number of decoder layers dedicated to the tracking path. '
+                             'The last N decoder layers are split into two separate paths: '
+                             'one for detection (class + box) and one for tracking (contrastive). '
+                             'Tracking gradients do NOT flow into the shared layers.')
     parser.add_argument('--maxFrames', default=50, type=int,
                         help='Maximum frames for temporal encoding')
     
@@ -228,9 +233,9 @@ def getArgsParser():
                         help='L1 box loss coefficient; per-epoch schedule')
     parser.add_argument('--giouLossCoef', default=[2.0], nargs='+', type=float,
                         help='GIoU loss coefficient; per-epoch schedule')
-    parser.add_argument('--eosCoef', default=[0.1], nargs='+', type=float,
+    parser.add_argument('--eosCoef', default=[0.1, 0.1, 0.11, 0.12, 0.13, 0.14, 0.15], nargs='+', type=float,
                         help='No-object class weight (higher = fewer false positives); per-epoch schedule')
-    parser.add_argument('--trackingLossCoef', default=[0.0], nargs='+', type=float,
+    parser.add_argument('--trackingLossCoef', default=[1.0], nargs='+', type=float,
                         help='Tracking contrastive loss coefficient; per-epoch schedule')
     parser.add_argument('--contrastiveTemp', default=[0.07], nargs='+', type=float,
                         help='Temperature for contrastive loss; per-epoch schedule')
@@ -250,7 +255,7 @@ def getArgsParser():
                         help='Coefficient for denoising losses (multiplied with base loss coefs); per-epoch schedule')
     
     # Duplicate suppression loss
-    parser.add_argument('--dupLossCoef', default=[0.0, 0.0, 0.25, 0.25, 0.25, 0.5], nargs='+', type=float,
+    parser.add_argument('--dupLossCoef', default=[0.25, 0.25, 0.25, 0.25, 0.25, 0.5], nargs='+', type=float,
                         help='Weight for IoU-based duplicate suppression loss; per-epoch schedule')
     
     # EMA (Exponential Moving Average)
@@ -324,7 +329,7 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-02-24/video_detr_best.pth', type=str,
+    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-02-26/video_detr_best.pth', type=str,
                         help='Path to pretrained DETR weights')
     #parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
     #                help='Path to pretrained DETR weights')
@@ -335,7 +340,7 @@ def getArgsParser():
                              'only newly initialised parameters are trained initially')
     parser.add_argument('--noFreezePretrained', dest='freezePretrained', action='store_false',
                         help='Disable freezing of pretrained weights')
-    parser.add_argument('--unfreezeAfterEpochs', default=5, type=int,
+    parser.add_argument('--unfreezeAfterEpochs', default=3, type=int,
                         help='Number of epochs after which frozen pretrained weights '
                              'are unfrozen and full training resumes (default: 3)')
     
@@ -598,10 +603,56 @@ def main(args):
         vidDetrLogger.info("Loading pretrained DETR weights from %s", args.pretrainedDetr)
         checkpoint = torch.load(args.pretrainedDetr, map_location='cpu')
         
+        # ---- Remap pretrained keys for split decoder paths ----
+        # A pretrained model without split paths has all decoder layers in
+        # ``transformer.decoder.layers.{0..N-1}`` and one ``transformer.decoder.norm``.
+        # After the split, the last ``numTrackingDecLayers`` layers are moved to
+        # ``detectionDecLayers.{0..M-1}`` and ``trackingDecLayers.{0..M-1}``,
+        # and the decoder norm becomes ``detectionDecNorm`` + ``trackingDecNorm``.
+        # We remap the pretrained keys accordingly so they load correctly.
+        rawPretrainedDict = checkpoint['model']
+        numSplit = getattr(args, 'numTrackingDecLayers', 1)
+        numShared = args.decLayers - numSplit  # decLayers was used to build transformer
+        
+        remappedDict = {}
+        for k, v in rawPretrainedDict.items():
+            # Remap split decoder layers
+            if k.startswith('transformer.decoder.layers.'):
+                # Extract layer index and the rest of the key
+                parts = k.split('.')
+                layerIdx = int(parts[3])
+                rest = '.'.join(parts[4:])
+                
+                if layerIdx < numShared:
+                    # Shared layer — keep in transformer.decoder.layers
+                    remappedDict[k] = v
+                else:
+                    # Split layer — map to detectionDecLayers AND trackingDecLayers
+                    splitIdx = layerIdx - numShared
+                    detKey = f'detectionDecLayers.{splitIdx}.{rest}'
+                    trackKey = f'trackingDecLayers.{splitIdx}.{rest}'
+                    remappedDict[detKey] = v
+                    remappedDict[trackKey] = v.clone()
+            elif k == 'transformer.decoder.norm.weight' or k == 'transformer.decoder.norm.bias':
+                # Decoder norm → detectionDecNorm AND trackingDecNorm
+                suffix = k.split('transformer.decoder.norm.')[-1]
+                remappedDict[f'detectionDecNorm.{suffix}'] = v
+                remappedDict[f'trackingDecNorm.{suffix}'] = v.clone()
+                # Don't map to transformer.decoder.norm since it's now None
+            else:
+                # All other keys pass through unchanged
+                remappedDict[k] = v
+        
+        vidDetrLogger.info(
+            "Remapped %d pretrained keys for split decoder "
+            "(%d shared + %d split layers)",
+            len(remappedDict), numShared, numSplit,
+        )
+        
         # Load compatible weights (skip mismatched layers)
         modelDict = modelWithoutDdp.state_dict()
         pretrainedDict = {
-            k: v for k, v in checkpoint['model'].items()
+            k: v for k, v in remappedDict.items()
             if k in modelDict and v.shape == modelDict[k].shape
         }
         notLoaded = set(modelDict.keys()) - set(pretrainedDict.keys())
@@ -611,7 +662,7 @@ def main(args):
                 vidDetrLogger.warning("  %s", k)
         modelDict.update(pretrainedDict)
         modelWithoutDdp.load_state_dict(modelDict, strict=False)
-        vidDetrLogger.info("Loaded %d/%d pretrained weights", len(pretrainedDict), len(checkpoint['model']))
+        vidDetrLogger.info("Loaded %d/%d pretrained weights", len(pretrainedDict), len(remappedDict))
 
         # ---- Freeze pretrained parameters ----
         if getattr(args, 'freezePretrained', False):

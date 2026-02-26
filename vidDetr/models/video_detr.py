@@ -107,7 +107,9 @@ class VideoDETR(nn.Module):
         useDnDenoising: bool = True,
         numDnGroups: int = 5,
         labelNoiseRatio: float = 0.5,
-        boxNoiseScale: float = 0.4
+        boxNoiseScale: float = 0.4,
+        # Split decoder path parameters
+        numTrackingDecLayers: int = 1,
     ):
         super().__init__()
         
@@ -118,6 +120,7 @@ class VideoDETR(nn.Module):
         self.numClasses = numClasses
         self.useDnDenoising = useDnDenoising
         self.headDropout = headDropout
+        self.numTrackingDecLayers = numTrackingDecLayers
         
         # Core components
         self.backbone = backbone
@@ -160,6 +163,47 @@ class VideoDETR(nn.Module):
             dropout=headDropout,
             normalize=True
         )
+        
+        # ---- Split decoder paths for detection and tracking ----
+        # The transformer decoder has `decLayers` layers total.
+        # The last `numTrackingDecLayers` layers are split into two separate
+        # paths: one for detection (class + box) and one for tracking.
+        # The shared layers (first decLayers - numTrackingDecLayers) remain
+        # in the transformer decoder and serve both tasks.
+        # The tracking path receives DETACHED hidden states from the shared
+        # layers so that tracking gradients do NOT flow into the shared part.
+        import copy
+        totalDecLayers = len(transformer.decoder.layers)
+        assert numTrackingDecLayers <= totalDecLayers, (
+            f"numTrackingDecLayers ({numTrackingDecLayers}) must be <= "
+            f"total decoder layers ({totalDecLayers})"
+        )
+        self.numSharedDecLayers = totalDecLayers - numTrackingDecLayers
+        
+        # Extract the split layers from the transformer decoder:
+        # - Detection path: the last numTrackingDecLayers layers
+        # - Tracking path: deep copies of those same layers (independent params)
+        splitLayers = list(transformer.decoder.layers[self.numSharedDecLayers:])
+        self.detectionDecLayers = nn.ModuleList(splitLayers)
+        self.trackingDecLayers = nn.ModuleList(
+            [copy.deepcopy(layer) for layer in splitLayers]
+        )
+        
+        # Separate layer norms for each path
+        self.detectionDecNorm = transformer.decoder.norm
+        self.trackingDecNorm = copy.deepcopy(transformer.decoder.norm)
+        
+        # Trim the shared decoder: keep only the shared layers
+        # (the split layers are now owned by detection/tracking paths)
+        transformer.decoder.layers = transformer.decoder.layers[:self.numSharedDecLayers]
+        transformer.decoder.num_layers = self.numSharedDecLayers
+        # We'll run the shared layers without the final norm (norm is applied per-path)
+        transformer.decoder.norm = None
+        # Disable return_intermediate on the shared decoder — we handle it manually
+        transformer.decoder.return_intermediate = False
+        
+        print(f"[VideoDETR] Split decoder: {self.numSharedDecLayers} shared layers + "
+              f"{numTrackingDecLayers} split layers (detection + tracking paths)")
         
         # Label denoising generator (DN-DETR / DINO style)
         if useDnDenoising:
@@ -366,33 +410,94 @@ class VideoDETR(nn.Module):
             pos=posConcat
         )
         
-        # Run transformer decoder with attention mask
-        # hs shape: [numDecoderLayers, totalQueries, B, hiddenDim]
-        hs = self.transformer.decoder(
-            tgt,
-            memory,
-            tgt_mask=attnMask,
-            memory_key_padding_mask=maskConcat,
-            pos=posConcat,
-            query_pos=queryEmbed
-        )
+        # ---- Run shared decoder layers ----
+        # The shared decoder (with return_intermediate=False) produces a
+        # single output tensor [totalQueries, B, hiddenDim].
+        # We collect intermediate outputs manually for auxiliary losses.
+        sharedIntermediate = []  # outputs from shared layers (for aux losses)
+        sharedOutput = tgt  # [totalQueries, B, hiddenDim]
         
-        # Transpose to [numDecoderLayers, B, totalQueries, hiddenDim]
-        hs = hs.transpose(1, 2)
+        for layer in self.transformer.decoder.layers:
+            sharedOutput = layer(
+                sharedOutput, memory,
+                tgt_mask=attnMask,
+                memory_key_padding_mask=maskConcat,
+                pos=posConcat,
+                query_pos=queryEmbed
+            )
+            # Store intermediate for aux losses (detection only)
+            sharedIntermediate.append(sharedOutput)
+        
+        # ---- Detection path: dedicated decoder layers ----
+        detIntermediate = []  # will include shared + detection-specific intermediates
+        detOutput = sharedOutput  # continues from shared output (gradients flow)
+        
+        for layer in self.detectionDecLayers:
+            detOutput = layer(
+                detOutput, memory,
+                tgt_mask=attnMask,
+                memory_key_padding_mask=maskConcat,
+                pos=posConcat,
+                query_pos=queryEmbed
+            )
+            detIntermediate.append(detOutput)
+        
+        # Apply detection norm to all intermediate outputs
+        # Shared intermediates (for aux losses - detection only)
+        sharedIntermediateNormed = [
+            self.detectionDecNorm(h) for h in sharedIntermediate
+        ]
+        # Detection-specific intermediates
+        detIntermediateNormed = [
+            self.detectionDecNorm(h) for h in detIntermediate
+        ]
+        
+        # The final detection output is the last detection-specific layer
+        # All intermediates for aux: shared layers + detection-specific layers
+        # (but the "main" output is always the last one)
+        allDetIntermediate = sharedIntermediateNormed + detIntermediateNormed
+        # Stack: [numTotalLayers, totalQueries, B, hiddenDim]
+        detHs = torch.stack(allDetIntermediate)
+        # Transpose to [numTotalLayers, B, totalQueries, hiddenDim]
+        detHs = detHs.transpose(1, 2)
+        
+        # ---- Tracking path: dedicated decoder layers with DETACHED input ----
+        # Detach the shared output to prevent tracking gradients from
+        # flowing into the shared layers and the detection path.
+        trackOutput = sharedOutput.detach()  # gradient barrier
+        
+        for layer in self.trackingDecLayers:
+            trackOutput = layer(
+                trackOutput, memory.detach(),
+                tgt_mask=attnMask,
+                memory_key_padding_mask=maskConcat,
+                pos=posConcat,
+                query_pos=queryEmbed.detach()
+            )
+        
+        # Apply tracking norm to the final tracking output
+        trackOutputNormed = self.trackingDecNorm(trackOutput)
+        # [totalQueries, B, hiddenDim] -> [1, B, totalQueries, hiddenDim]
+        trackHs = trackOutputNormed.unsqueeze(0).transpose(1, 2)
         
         # ---- Split DN and matching outputs ----
         if dnInfo is not None:
             dnMeta = dnInfo['dn_meta']
-            dnHs, matchHs = self.denoisingGenerator.splitDnOutputs(hs, dnMeta)
+            dnDetHs, matchDetHs = self.denoisingGenerator.splitDnOutputs(detHs, dnMeta)
+            # For tracking, we only care about matching queries (not DN)
+            _, matchTrackHs = self.denoisingGenerator.splitDnOutputs(trackHs, dnMeta)
         else:
             dnMeta = None
-            matchHs = hs
+            matchDetHs = detHs
+            matchTrackHs = trackHs
         
-        # Compute matching outputs (with head dropout for regularization)
-        matchHsDropped = self.headDropoutLayer(matchHs)
-        outputsClass = self.classEmbed(matchHsDropped)  # [numLayers, B, numQueries, numClasses+1]
-        outputsCoord = self.bboxEmbed(matchHsDropped).sigmoid()  # [numLayers, B, numQueries, 4]
-        outputsTracking = self.trackingHead(matchHs)  # [numLayers, B, numQueries, trackingDim]
+        # Compute detection outputs (with head dropout for regularization)
+        matchDetHsDropped = self.headDropoutLayer(matchDetHs)
+        outputsClass = self.classEmbed(matchDetHsDropped)  # [numLayers, B, numQueries, numClasses+1]
+        outputsCoord = self.bboxEmbed(matchDetHsDropped).sigmoid()  # [numLayers, B, numQueries, 4]
+        
+        # Compute tracking outputs (only from tracking path, last layer)
+        outputsTracking = self.trackingHead(matchTrackHs)  # [1, B, numQueries, trackingDim]
         
         # Build output dict (using last decoder layer)
         out = {
@@ -401,18 +506,18 @@ class VideoDETR(nn.Module):
             'pred_tracking': outputsTracking[-1]
         }
         
-        # Add auxiliary outputs if enabled
+        # Add auxiliary outputs if enabled (detection only, no tracking in aux)
         if self.auxLoss:
             out['aux_outputs'] = self._setAuxLoss(
-                outputsClass, outputsCoord, outputsTracking
+                outputsClass, outputsCoord
             )
         
         # ---- Add denoising outputs (training only) ----
         if dnMeta is not None:
             # Apply same detection heads to DN outputs
-            dnHsDropped = self.headDropoutLayer(dnHs)
-            dnOutputsClass = self.classEmbed(dnHsDropped)  # [numLayers, B, dnQueries, numClasses+1]
-            dnOutputsCoord = self.bboxEmbed(dnHsDropped).sigmoid()  # [numLayers, B, dnQueries, 4]
+            dnDetHsDropped = self.headDropoutLayer(dnDetHs)
+            dnOutputsClass = self.classEmbed(dnDetHsDropped)  # [numLayers, B, dnQueries, numClasses+1]
+            dnOutputsCoord = self.bboxEmbed(dnDetHsDropped).sigmoid()  # [numLayers, B, dnQueries, 4]
             
             out['dn_pred_logits'] = dnOutputsClass[-1]
             out['dn_pred_boxes'] = dnOutputsCoord[-1]
@@ -435,10 +540,13 @@ class VideoDETR(nn.Module):
         self,
         outputsClass: Tensor,
         outputsCoord: Tensor,
-        outputsTracking: Tensor
     ) -> List[Dict[str, Tensor]]:
         """
         Create auxiliary output dicts for intermediate decoder layers.
+        
+        Only detection outputs (class + box) are included in auxiliary losses.
+        Tracking is computed exclusively from the dedicated tracking path
+        at the final layer and is NOT included in auxiliary losses.
         
         This is a workaround to make torchscript happy, as torchscript
         doesn't support dictionary with non-homogeneous values.
@@ -447,12 +555,10 @@ class VideoDETR(nn.Module):
             {
                 'pred_logits': a,
                 'pred_boxes': b,
-                'pred_tracking': c
             }
-            for a, b, c in zip(
+            for a, b in zip(
                 outputsClass[:-1],
                 outputsCoord[:-1],
-                outputsTracking[:-1]
             )
         ]
     
@@ -527,7 +633,8 @@ def buildVideoDETR(args) -> Tuple[VideoDETR, nn.Module, Dict[str, nn.Module]]:
         useDnDenoising=getattr(args, 'useDnDenoising', True),
         numDnGroups=getattr(args, 'numDnGroups', 5),
         labelNoiseRatio=_first(getattr(args, 'labelNoiseRatio', 0.5), 0.5),
-        boxNoiseScale=_first(getattr(args, 'boxNoiseScale', 0.4), 0.4)
+        boxNoiseScale=_first(getattr(args, 'boxNoiseScale', 0.4), 0.4),
+        numTrackingDecLayers=getattr(args, 'numTrackingDecLayers', 1),
     )
     
     # Build criterion
