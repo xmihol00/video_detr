@@ -30,14 +30,6 @@ Dataset structure expected:
                     └── ...
 """
 
-import sys
-from pathlib import Path
-
-# Add parent directory to path for imports - must be before other imports
-_parentDir = Path(__file__).resolve().parent.parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
 import hashlib
 import json
 import math
@@ -50,7 +42,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from datasets import transforms as T
+from vidDetr.datasets import transforms as T
 
 
 # ---------------------------------------------------------------------------

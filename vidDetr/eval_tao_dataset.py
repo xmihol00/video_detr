@@ -32,14 +32,6 @@ Usage:
     python vidDetr/eval_tao_dataset.py --taoDataRoot /path/to/tao
 """
 
-import sys
-from pathlib import Path
-
-# Add parent directory to path for imports
-_parentDir = Path(__file__).resolve().parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
 import argparse
 import random
 from typing import Dict, List, Any, Optional

@@ -11,18 +11,11 @@ Logging is done via Python's standard ``logging`` module and per-batch /
 per-epoch metrics are tracked in CSV files through ``MetricTracker``.
 """
 
-import sys
-from pathlib import Path
-
-# Add parent directory to path for imports - must be before other imports
-_parentDir = Path(__file__).resolve().parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
 import logging
 import math
 import os
 import random as pyrandom
+import sys
 import time
 import copy
 from typing import Any, Dict, Iterable, List, Optional
@@ -32,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import util.misc as utils
+import vidDetr.util.misc as utils
 from vidDetr.logging_utils import MetricTracker
 
 logger = logging.getLogger("vidDetr")

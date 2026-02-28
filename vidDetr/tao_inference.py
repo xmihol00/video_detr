@@ -41,14 +41,6 @@ while True:
         time.sleep(5)
         pass
 
-import sys
-from pathlib import Path
-
-# Add parent directory to path for imports
-_parentDir = Path(__file__).resolve().parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
 import argparse
 import json
 import random
@@ -61,8 +53,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from util.misc import nested_tensor_from_tensor_list
-from datasets import transforms as T
+from vidDetr.util.misc import nested_tensor_from_tensor_list
+from vidDetr.datasets import transforms as T
 from vidDetr.models import buildVideoDETR
 
 # ImageNet normalisation (same as training)

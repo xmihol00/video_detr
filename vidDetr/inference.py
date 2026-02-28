@@ -22,15 +22,10 @@ Keys during visualisation:
     q / ESC         – quit
 """
 
+import argparse
+import os
 import sys
 from pathlib import Path
-
-# Add parent directory to path for imports
-_parentDir = Path(__file__).resolve().parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
-import argparse
 import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,8 +37,8 @@ import torch.nn.functional as F
 import yaml
 from PIL import Image
 
-from util.misc import NestedTensor, nested_tensor_from_tensor_list
-from datasets import transforms as T
+from vidDetr.util.misc import NestedTensor, nested_tensor_from_tensor_list
+from vidDetr.datasets import transforms as T
 from vidDetr.models import buildVideoDETR
 
 # ---------------------------------------------------------------------------
@@ -67,7 +62,7 @@ def getArgsParser() -> argparse.ArgumentParser:
     # Required
     parser.add_argument(
         "--modelPath",
-        default="checkpoint_latest.pth",
+        default="video_detr_best.pth",
         type=str,
         help="Path to a VideoDETR checkpoint (.pth)",
     )
@@ -83,6 +78,14 @@ def getArgsParser() -> argparse.ArgumentParser:
         type=str,
         help="Path to data.yaml (used for class names)",
     )
+
+    # Optional
+    parser.add_argument(
+        "--index",
+        default=0,
+        type=int,
+        help="Index of the sequence to start with (default: 0)",
+    )   
 
     # Inference behaviour
     parser.add_argument(
@@ -779,7 +782,7 @@ def main():
         print(f"[Inference] Saving annotated frames to {saveDir}")
 
     # ---- Interactive visualisation loop ----
-    seqIdx = 1
+    seqIdx = args.index
 
     while 0 <= seqIdx < len(seqIds):
         seqId = seqIds[seqIdx]
@@ -840,6 +843,12 @@ def main():
             elif key == ord("p"):  # previous sequence
                 seqIdx -= 2  # will be incremented below
                 break
+            elif key == ord("s"):  # save current frame (debug)
+                debugPath = Path(f"stored_frames/debug_seq{seqId}_frame{fIdx:04d}.jpg")
+                os.makedirs(debugPath.parent, exist_ok=True)
+                cv2.imwrite(str(debugPath), vis)
+                print(f"  Saved debug image to {debugPath}")
+                fPos += 1
             else:
                 fPos += 1  # default: advance
 

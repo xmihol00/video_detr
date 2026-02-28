@@ -11,21 +11,13 @@ The Hungarian matching is performed per-frame, and tracking correspondences
 are established using the trackIds from the dataset.
 """
 
-import sys
-from pathlib import Path
-
-# Add parent directory to path for imports - must be before other imports
-_parentDir = Path(__file__).resolve().parent.parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 from typing import Dict, List, Optional, Tuple, Any
 
-from util import box_ops
-from util.misc import (
+from vidDetr.util import box_ops
+from vidDetr.util.misc import (
     accuracy, 
     get_world_size, 
     is_dist_avail_and_initialized,

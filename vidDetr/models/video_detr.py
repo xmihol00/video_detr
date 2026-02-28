@@ -13,22 +13,14 @@ Key modifications from DETR:
 4. Add tracking embedding head for cross-frame association
 """
 
-import sys
-from pathlib import Path
-
-# Add parent directory to path for imports - must be before other imports
-_parentDir = Path(__file__).resolve().parent.parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 from typing import Dict, List, Optional, Tuple, Any
 
-from util.misc import NestedTensor, nested_tensor_from_tensor_list
-from models.backbone import build_backbone
-from models.transformer import build_transformer
+from vidDetr.util.misc import NestedTensor, nested_tensor_from_tensor_list
+from vidDetr.models.detr.backbone import build_backbone
+from vidDetr.models.detr.transformer import build_transformer
 
 from .temporal_encoding import TemporalPositionEncoding, buildTemporalEncoding
 from .tracking_head import TrackingHead

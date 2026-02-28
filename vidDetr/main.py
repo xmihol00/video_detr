@@ -16,15 +16,9 @@ For distributed training:
     torchrun --nproc_per_node=2 main.py --dataConfig data.yaml
 """
 
+import argparse
 import sys
 from pathlib import Path
-
-# Add parent directory to path for imports - must be before other imports
-_parentDir = Path(__file__).resolve().parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
-import argparse
 import datetime
 import os
 import random
@@ -41,7 +35,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 # quickly exhausts the 1024 FD limit on shared machines with video batches.
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-import util.misc as utils
+import vidDetr.util.misc as utils
 from vidDetr.models import buildVideoDETR
 from vidDetr.datasets import VideoSequenceDataset, buildVideoDataset, videoCollateFn
 from vidDetr.datasets import TaoDataset, buildTaoDataset, taoCollateFn
@@ -188,7 +182,7 @@ def getArgsParser():
                         help='Feedforward dimension in transformer')
     parser.add_argument('--hiddenDim', default=256, type=int,
                         help='Transformer hidden dimension')
-    parser.add_argument('--dropout', default=[0.1, 0.1, 0.1, 0.15, 0.15, 0.15], nargs='+', type=float,
+    parser.add_argument('--dropout', default=[0.15, 0.15, 0.15], nargs='+', type=float,
                         help='Dropout rate in transformer and heads; per-epoch schedule')
     parser.add_argument('--nheads', default=8, type=int,
                         help='Number of attention heads')
@@ -233,7 +227,7 @@ def getArgsParser():
                         help='L1 box loss coefficient; per-epoch schedule')
     parser.add_argument('--giouLossCoef', default=[2.0], nargs='+', type=float,
                         help='GIoU loss coefficient; per-epoch schedule')
-    parser.add_argument('--eosCoef', default=[0.1, 0.1, 0.11, 0.12, 0.13, 0.14, 0.15], nargs='+', type=float,
+    parser.add_argument('--eosCoef', default=[0.15, 0.16, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.3], nargs='+', type=float,
                         help='No-object class weight (higher = fewer false positives); per-epoch schedule')
     parser.add_argument('--trackingLossCoef', default=[1.0], nargs='+', type=float,
                         help='Tracking contrastive loss coefficient; per-epoch schedule')
@@ -255,7 +249,7 @@ def getArgsParser():
                         help='Coefficient for denoising losses (multiplied with base loss coefs); per-epoch schedule')
     
     # Duplicate suppression loss
-    parser.add_argument('--dupLossCoef', default=[0.25, 0.25, 0.25, 0.25, 0.25, 0.5], nargs='+', type=float,
+    parser.add_argument('--dupLossCoef', default=[0.25, 0.2, 0.15, 0.1, 0.05, 0.0], nargs='+', type=float,
                         help='Weight for IoU-based duplicate suppression loss; per-epoch schedule')
     
     # EMA (Exponential Moving Average)
@@ -267,7 +261,7 @@ def getArgsParser():
                         help='EMA decay rate')
     
     # Drop path (stochastic depth)
-    parser.add_argument('--dropPathRate', default=[0.025, 0.05, 0.075, 0.1], nargs='+', type=float,
+    parser.add_argument('--dropPathRate', default=[0.025, 0.033, 0.05, 0.066, 0.075, 0.1], nargs='+', type=float,
                         help='Drop path rate for stochastic depth regularization; per-epoch schedule')
     
     # Dataset parameters
@@ -329,7 +323,7 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-02-26/video_detr_best.pth', type=str,
+    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-02-28/video_detr_best.pth', type=str,
                         help='Path to pretrained DETR weights')
     #parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
     #                help='Path to pretrained DETR weights')

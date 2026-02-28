@@ -18,11 +18,6 @@ import os
 # Disable triton to avoid environment issues
 os.environ['TRITON_DISABLE'] = '1'
 
-# Add parent directory for imports - must be before other imports
-_parentDir = Path(__file__).resolve().parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
 import torch
 import torch.nn as nn
 
@@ -375,8 +370,8 @@ def testVideoDETRModel():
     
     print("\n1. Building model components...")
     
-    from models.backbone import build_backbone
-    from models.transformer import build_transformer
+    from vidDetr.models.detr.backbone import build_backbone
+    from vidDetr.models.detr.transformer import build_transformer
     from vidDetr.models.video_detr import VideoDETR
     from vidDetr.losses.video_criterion import buildVideoCriterion
     
@@ -412,7 +407,7 @@ def testVideoDETRModel():
     
     # Create synthetic input
     print("\n2. Testing forward pass...")
-    from util.misc import NestedTensor
+    from vidDetr.util.misc import NestedTensor
     
     batchSize = 1
     imgSize = 224  # Smaller for CPU testing

@@ -22,14 +22,6 @@ Label format (YOLO style):
     (normalized coordinates in [0, 1])
 """
 
-import sys
-from pathlib import Path
-
-# Add parent directory to path for imports - must be before other imports
-_parentDir = Path(__file__).resolve().parent.parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
 import hashlib
 import json
 import os
@@ -42,7 +34,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 import yaml
 
-from datasets import transforms as T
+from vidDetr.datasets import transforms as T
 
 # Cache version - increment when cache format changes
 CACHE_VERSION = "1.0"
@@ -567,7 +559,7 @@ def videoCollateFn(batch: List[Tuple]) -> Tuple[List[Any], List[List[Dict]]]:
         - targetsList: List of N lists of target dicts
     """
     # Import NestedTensor utilities
-    from util.misc import nested_tensor_from_tensor_list
+    from vidDetr.util.misc import nested_tensor_from_tensor_list
     
     # Unzip batch
     imagesBatch = [item[0] for item in batch]  # List of B lists of N tensors

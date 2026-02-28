@@ -20,20 +20,12 @@ For video: denoising queries are created per-frame, respecting the frame-based
 query organization of VideoDETR.
 """
 
-import sys
-from pathlib import Path
-
-# Add parent directory to path for imports - must be before other imports
-_parentDir = Path(__file__).resolve().parent.parent.parent
-if str(_parentDir) not in sys.path:
-    sys.path.insert(0, str(_parentDir))
-
 import torch
 import torch.nn as nn
 from torch import Tensor
 from typing import Dict, List, Optional, Tuple
 
-from util import box_ops
+from vidDetr.util import box_ops
 
 
 class DenoisingGenerator(nn.Module):
