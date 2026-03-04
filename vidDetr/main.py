@@ -30,6 +30,10 @@ import torch
 import torch.multiprocessing
 from torch.utils.data import DataLoader, DistributedSampler
 
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 # Use file_system sharing strategy to avoid running out of file descriptors.
 # The default 'file_descriptor' strategy uses one FD per shared tensor, which
 # quickly exhausts the 1024 FD limit on shared machines with video batches.
@@ -37,8 +41,9 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 import vidDetr.util.misc as utils
 from vidDetr.models import buildVideoDETR
-from vidDetr.datasets import VideoSequenceDataset, buildVideoDataset, videoCollateFn
+from vidDetr.datasets import SimulatedVideoSequenceDataset, buildVideoDataset, videoCollateFn
 from vidDetr.datasets import TaoDataset, buildTaoDataset, taoCollateFn
+from vidDetr.datasets import VideoDataset, buildVideoDatasetFromArgs, videoDatasetCollateFn
 from vidDetr.engine import trainOneEpoch, evaluate, ModelEMA
 from vidDetr.logging_utils import setupLogging, MetricTracker
 
@@ -227,7 +232,7 @@ def getArgsParser():
                         help='L1 box loss coefficient; per-epoch schedule')
     parser.add_argument('--giouLossCoef', default=[2.0], nargs='+', type=float,
                         help='GIoU loss coefficient; per-epoch schedule')
-    parser.add_argument('--eosCoef', default=[0.15, 0.16, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.3], nargs='+', type=float,
+    parser.add_argument('--eosCoef', default=[0.05, 0.1, 0.125, 0.15, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.3], nargs='+', type=float,
                         help='No-object class weight (higher = fewer false positives); per-epoch schedule')
     parser.add_argument('--trackingLossCoef', default=[1.0], nargs='+', type=float,
                         help='Tracking contrastive loss coefficient; per-epoch schedule')
@@ -249,7 +254,7 @@ def getArgsParser():
                         help='Coefficient for denoising losses (multiplied with base loss coefs); per-epoch schedule')
     
     # Duplicate suppression loss
-    parser.add_argument('--dupLossCoef', default=[0.25, 0.2, 0.15, 0.1, 0.05, 0.0], nargs='+', type=float,
+    parser.add_argument('--dupLossCoef', default=[0.0, 0.0, 0.0, 0.1, 0.25, 0.2, 0.15, 0.1, 0.05, 0.0], nargs='+', type=float,
                         help='Weight for IoU-based duplicate suppression loss; per-epoch schedule')
     
     # EMA (Exponential Moving Average)
@@ -267,7 +272,7 @@ def getArgsParser():
     # Dataset parameters
     parser.add_argument('--dataConfig', default='vidDetr/data.yaml', type=str,
                         help='Path to dataset configuration YAML')
-    parser.add_argument('--numClasses', default=80, type=int,
+    parser.add_argument('--numClasses', default=2, type=int,
                         help='Number of object classes')
     parser.add_argument('--framesPerSequence', default=50, type=int,
                         help='Total frames in each video sequence')
@@ -289,6 +294,25 @@ def getArgsParser():
                         help='Keep only top-N most frequent TAO categories (None=all)')
     parser.add_argument('--taoWindowOverlap', default=0.5, type=float,
                         help='Overlap fraction between TAO video windows (0-1)')
+    
+    # Video dataset parameters (single long-sequence format)
+    parser.add_argument('--videoDataRoot', default="/mnt/matylda5/xmihol00/datasets/climbing_videos", type=str,
+                        help='Root directory of video dataset containing train/ and val/ '
+                             'subdirs (each with images/ and labels/). '
+                             'Overrides --dataConfig and --taoDataRoot.')
+    parser.add_argument('--videoTrainBatches', default=1000, type=int,
+                        help='Number of batches per training epoch for video dataset')
+    parser.add_argument('--videoValBatches', default=50, type=int,
+                        help='Number of batches per validation epoch for video dataset')
+    parser.add_argument('--videoMaxFrameOffset', default=30, type=int,
+                        help='Maximum gap between consecutive sampled frames '
+                             'in the video dataset')
+    parser.add_argument('--videoSamplingStrategy', default='mixed', type=str,
+                        choices=['random_walk', 'exponential_stride', 'mixed'],
+                        help='Frame sampling strategy for video dataset: '
+                             'random_walk (random offsets 0-maxOffset), '
+                             'exponential_stride (geometric stride distribution), '
+                             'mixed (SOTA blend of tight and wide clips)')
     
     # Merge train + val
     parser.add_argument('--mergeTrainVal', action='store_true', default=False,
@@ -323,7 +347,7 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-02-28/video_detr_best.pth', type=str,
+    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-03-03/video_detr_best.pth', type=str,
                         help='Path to pretrained DETR weights')
     #parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
     #                help='Path to pretrained DETR weights')
@@ -334,7 +358,7 @@ def getArgsParser():
                              'only newly initialised parameters are trained initially')
     parser.add_argument('--noFreezePretrained', dest='freezePretrained', action='store_false',
                         help='Disable freezing of pretrained weights')
-    parser.add_argument('--unfreezeAfterEpochs', default=3, type=int,
+    parser.add_argument('--unfreezeAfterEpochs', default=1, type=int,
                         help='Number of epochs after which frozen pretrained weights '
                              'are unfrozen and full training resumes (default: 3)')
     
@@ -501,17 +525,20 @@ def main(args):
     # before the model and criterion are constructed.
     mergeTrainVal = getattr(args, 'mergeTrainVal', False)
     vidDetrLogger.info("Building datasets...")
-    if args.taoDataRoot:
+    if getattr(args, 'videoDataRoot', None):
+        datasetTrain, datasetVal = buildVideoDatasetFromArgs(args)
+        collateFn = videoDatasetCollateFn
+    elif args.taoDataRoot:
         datasetTrain, datasetVal = buildTaoDataset(args)
         collateFn = taoCollateFn
     else:
         datasetTrain, datasetVal = buildVideoDataset(args)
         collateFn = videoCollateFn
-    vidDetrLogger.info("Train dataset: %d sequences", len(datasetTrain))
+    vidDetrLogger.info("Train dataset: %d samples", len(datasetTrain))
     if datasetVal is not None:
-        vidDetrLogger.info("Val dataset: %d sequences", len(datasetVal))
+        vidDetrLogger.info("Val dataset: %d samples", len(datasetVal))
     else:
-        vidDetrLogger.info("Val dataset: None (merged into training set)")
+        vidDetrLogger.info("Val dataset: None (empty or merged into training set)")
     
     # Build model, criterion, and postprocessors
     model, criterion, postprocessors = buildVideoDETR(args)
@@ -676,6 +703,8 @@ def main(args):
             optimizer, lrScheduler = buildOptimizerAndScheduler(
                 args, modelWithoutDdp, logger=vidDetrLogger,
             )
+    else:
+        vidDetrLogger.info(f"No pretrained weights specified (--pretrainedDetr={args.pretrainedDetr}), training from scratch")
     
     # Resume from checkpoint
     bestMetric = float('inf')  # Initialize best metric tracker
@@ -724,7 +753,7 @@ def main(args):
     # Evaluation only
     if args.eval:
         if dataLoaderVal is None:
-            vidDetrLogger.error("Cannot evaluate: no validation set (--mergeTrainVal is active)")
+            vidDetrLogger.error("Cannot evaluate: no validation set (--mergeTrainVal is active or val split is empty)")
             return
         valTracker = MetricTracker(outputDir=args.outputDir, phase="val")
         testStats = evaluate(

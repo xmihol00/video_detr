@@ -1,524 +1,524 @@
 # Copyright (c) 2026. All Rights Reserved.
 """
-Video Sequence Dataset for VideoDETR.
+Video Dataset for VideoDETR — single long-sequence format.
 
-This module implements a dataset loader for video sequences in YOLO format with
-tracking annotations. The key feature is that objects on the same line number
-across label files in a sequence represent the same object (tracking correspondence).
+This module implements a dataset loader for a video dataset where **all
+frames belong to one long video sequence** (per split).  Images are sorted
+alphabetically to establish temporal order, and labels carry explicit
+track IDs.
 
 Dataset structure:
-    train/
-    ├── images/
-    │   ├── seq_000001_frame_0000.jpg
-    │   ├── seq_000001_frame_0001.jpg
-    │   └── ...
-    └── labels/
-        ├── seq_000001_frame_0000.txt
-        ├── seq_000001_frame_0001.txt
-        └── ...
+    <dataRoot>/
+    ├── train/
+    │   ├── images/
+    │   │   ├── frame_000000.jpg
+    │   │   ├── frame_000001.jpg
+    │   │   └── ...
+    │   └── labels/
+    │       ├── frame_000000.txt
+    │       ├── frame_000001.txt
+    │       └── ...
+    └── val/
+        ├── images/   (may be empty initially)
+        └── labels/   (may be empty initially)
 
-Label format (YOLO style):
-    class_id center_x center_y width height
-    (normalized coordinates in [0, 1])
+Label format (one object per line):
+    track_id  class_id  cx  cy  w  h
+    (cx, cy, w, h are normalised coordinates in [0, 1])
+
+Because the dataset is a single sequence, the natural ``__len__`` equals
+the number of valid clips that can be formed from the frames.  However,
+since the sequence can be extremely long, the user can cap the number of
+batches seen per epoch via ``batchesPerEpoch`` (default: 1000 for train,
+50 for val).  The dataset's ``__len__`` is set to
+``batchesPerEpoch * batchSize`` so that the dataloader exhausts it in
+exactly the desired number of batches.
+
+Frame sampling strategies (configurable via ``--videoSamplingStrategy``):
+
+1. **random_walk** (default) — pick a random starting frame, then add a
+   random offset in [0, ``maxFrameOffset``] for each subsequent frame.
+   This is the simplest approach and gives good variety.
+
+2. **exponential_stride** — pick a random base stride from a geometric
+   distribution (small strides are more likely) and sample frames evenly
+   at that stride.  Inspired by TAO / BURST temporal sampling.
+
+3. **mixed** — SOTA-style strategy that blends short-range fine-grained
+   clips and long-range coarse clips.  With probability 0.5 it samples a
+   tight clip (offset 0-5), and with 0.5 it samples a wide clip (offset
+   5-``maxFrameOffset``).  This is similar to the multi-scale temporal
+   jittering used in TubeDETR / TrackFormer / MOTR.
 """
 
 import hashlib
 import json
 import os
 import random
-import re
-from typing import Dict, List, Optional, Tuple, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from torch.utils.data import Dataset
-from PIL import Image
 import yaml
+from PIL import Image
+from torch.utils.data import Dataset
 
 from vidDetr.datasets import transforms as T
 
-# Cache version - increment when cache format changes
+# Cache version — bump when on-disk format changes.
 CACHE_VERSION = "1.0"
 
 
-class VideoSequenceDataset(Dataset):
+# ======================================================================
+#  Sampling strategies
+# ======================================================================
+
+def _sampleRandomWalk(
+    numFrames: int,
+    totalFrames: int,
+    maxOffset: int,
+) -> List[int]:
     """
-    Dataset for loading video sequences with tracking annotations.
-    
-    Each sample consists of N frames from a single video sequence, along with
-    bounding box annotations and tracking IDs (derived from line numbers in
-    label files).
-    
+    Random-walk sampling: pick a random start, then step forward by a
+    random offset in [0, maxOffset] for each subsequent frame.
+
+    Guarantees:
+    - All indices are in [0, totalFrames).
+    - Consecutive frames are at most ``maxOffset`` frames apart.
+    - The sequence is strictly non-decreasing.
+    """
+    # The maximum span of the clip is (numFrames - 1) * maxOffset.
+    maxSpan = (numFrames - 1) * maxOffset
+    # The latest possible start so that we can still fit the clip even
+    # if all offsets are at maximum.
+    latestStart = max(0, totalFrames - 1 - maxSpan)
+    start = random.randint(0, max(0, totalFrames - 1)) if latestStart == 0 else random.randint(0, latestStart)
+
+    indices = [start]
+    for _ in range(numFrames - 1):
+        offset = random.randint(0, maxOffset)
+        nextIdx = min(indices[-1] + offset, totalFrames - 1)
+        indices.append(nextIdx)
+    return indices
+
+
+def _sampleExponentialStride(
+    numFrames: int,
+    totalFrames: int,
+    minGap: int,
+    maxGap: int,
+) -> List[int]:
+    """
+    Exponential-stride sampling: pick a stride with geometrically
+    decreasing probability (smaller strides more likely).  Then
+    sample at that uniform stride.
+    """
+    # Choose stride with P(stride=s) ∝ 0.5^(s - minGap)
+    maxPossibleGap = min(maxGap, (totalFrames - 1) // max(numFrames - 1, 1))
+    maxPossibleGap = max(maxPossibleGap, minGap)
+
+    weights = [0.5 ** (g - minGap) for g in range(minGap, maxPossibleGap + 1)]
+    total = sum(weights)
+    r = random.random() * total
+    cumulative = 0.0
+    stride = minGap
+    for g, w in zip(range(minGap, maxPossibleGap + 1), weights):
+        cumulative += w
+        if r <= cumulative:
+            stride = g
+            break
+
+    span = (numFrames - 1) * stride
+    maxStart = max(0, totalFrames - 1 - span)
+    start = random.randint(0, maxStart)
+    return [start + i * stride for i in range(numFrames)]
+
+
+def _sampleMixed(
+    numFrames: int,
+    totalFrames: int,
+    maxOffset: int,
+) -> List[int]:
+    """
+    SOTA mixed sampling: with p=0.5 use a tight clip (offset 0-5) and
+    with p=0.5 use a wide clip (offset 5-maxOffset).  This gives the
+    model exposure to both fine-grained and coarse temporal dynamics,
+    similar to multi-scale temporal jittering in MOTR / TrackFormer.
+    """
+    tightMax = min(5, maxOffset)
+    wideMin = min(5, maxOffset)
+
+    if random.random() < 0.5:
+        # Tight clip
+        return _sampleRandomWalk(numFrames, totalFrames, tightMax)
+    else:
+        # Wide clip — use exponential stride for the wide part
+        return _sampleExponentialStride(numFrames, totalFrames, wideMin, maxOffset)
+
+
+SAMPLING_STRATEGIES = {
+    "random_walk": _sampleRandomWalk,
+    "exponential_stride": _sampleExponentialStride,
+    "mixed": _sampleMixed,
+}
+
+
+# ======================================================================
+#  Dataset
+# ======================================================================
+
+class VideoDataset(Dataset):
+    """
+    Dataset for a single long video sequence per split.
+
+    The dataset scans all images under ``dataRoot/images/`` and sorts them
+    alphabetically to establish temporal order.  Each ``__getitem__`` call
+    samples ``numFrames`` frames from this sequence using the configured
+    sampling strategy.
+
+    Because the dataset is a single sequence, the ``__len__`` is set to
+    ``epochLength`` so that one epoch corresponds to a fixed number of
+    samples (= ``batchesPerEpoch * batchSize``).
+
     Args:
-        dataRoot: Root directory containing 'images' and 'labels' subdirs
-        numFrames: Number of frames to sample per sequence (default: 5)
-        transforms: Optional transforms to apply to each frame
-        imageSet: 'train' or 'val' (affects augmentation behavior)
-        framesPerSequence: Total frames in each sequence (default: 50)
-        minFrameGap: Minimum gap between sampled frames (default: 1)
-        maxFrameGap: Maximum gap between sampled frames (default: 10)
-        classNames: Optional list of class names
-        useCache: Whether to use cached sequence information (default: True)
-        minBoxSize: Minimum GT box size as a fraction of image width or
-                    height.  Boxes whose normalised width **and** height
-                    are both smaller than this value are dropped.
-                    Set to 0.0 to keep all boxes.  Default: 0.0.
+        dataRoot:           Path containing ``images/`` and ``labels/`` dirs.
+        numFrames:          Frames per clip.
+        transforms:         DETR-style per-frame transforms.
+        imageSet:           ``'train'`` or ``'val'``.
+        batchesPerEpoch:    Number of batches that constitute one epoch.
+        batchSize:          Batch size (needed to compute epoch length).
+        maxFrameOffset:     Maximum gap between consecutive sampled frames.
+        samplingStrategy:   One of ``'random_walk'``, ``'exponential_stride'``,
+                            or ``'mixed'``.
+        classNames:         Optional list of class names.
+        numClasses:         Number of object classes.
+        useCache:           Cache the discovered frame list.
+        minBoxSize:         Minimum normalised box size (boxes with both
+                            w and h below this are dropped).
     """
-    
-    # Regex pattern for parsing filenames: seq_XXXXXX_frame_XXXX
-    FILENAME_PATTERN = re.compile(r'seq_(\d{6})_frame_(\d{4})')
-    
+
     def __init__(
         self,
         dataRoot: str,
         numFrames: int = 5,
         transforms: Optional[Any] = None,
-        imageSet: str = 'train',
-        framesPerSequence: int = 50,
-        minFrameGap: int = 1,
-        maxFrameGap: int = 10,
+        imageSet: str = "train",
+        batchesPerEpoch: int = 1000,
+        batchSize: int = 32,
+        maxFrameOffset: int = 30,
+        samplingStrategy: str = "mixed",
         classNames: Optional[List[str]] = None,
+        numClasses: int = 80,
         useCache: bool = True,
         minBoxSize: float = 0.0,
     ):
         super().__init__()
-        
+
         self.dataRoot = Path(dataRoot)
         self.numFrames = numFrames
         self.transforms = transforms
         self.imageSet = imageSet
-        self.framesPerSequence = framesPerSequence
-        self.minFrameGap = minFrameGap
-        self.maxFrameGap = maxFrameGap
+        self.batchesPerEpoch = batchesPerEpoch
+        self.batchSize = batchSize
+        self.maxFrameOffset = maxFrameOffset
+        self.samplingStrategy = samplingStrategy
         self.classNames = classNames
+        self.numClasses = numClasses
         self.useCache = useCache
         self.minBoxSize = minBoxSize
-        
-        # Paths to images and labels directories
-        self.imagesDir = self.dataRoot / 'images'
-        self.labelsDir = self.dataRoot / 'labels'
-        
-        # Validate directories exist
+
+        self.imagesDir = self.dataRoot / "images"
+        self.labelsDir = self.dataRoot / "labels"
+
+        # The directories must exist, but may be empty (especially val).
         assert self.imagesDir.exists(), f"Images directory not found: {self.imagesDir}"
         assert self.labelsDir.exists(), f"Labels directory not found: {self.labelsDir}"
-        
-        # Discover all sequences and their frames (with caching)
-        self.sequences = self._loadOrDiscoverSequences()
-        
-        # Create list of sequence IDs for indexing
-        self.sequenceIds = list(self.sequences.keys())
-        
-        print(f"[VideoSequenceDataset] Found {len(self.sequences)} sequences "
-              f"with {numFrames} frames per sample")
-    
+
+        # Discover frames (sorted alphabetically = temporal order).
+        self.framePaths: List[Path] = self._loadOrDiscoverFrames()
+        self.totalFrames = len(self.framePaths)
+
+        # Epoch length = batchesPerEpoch * batchSize.  If fewer frames are
+        # available (or zero), we clamp appropriately.
+        if self.totalFrames == 0:
+            self._epochLength = 0
+        else:
+            self._epochLength = batchesPerEpoch * batchSize
+
+        print(
+            f"[VideoDataset] {imageSet}: {self.totalFrames} frames, "
+            f"epochLength={self._epochLength}, "
+            f"strategy={samplingStrategy}, "
+            f"maxOffset={maxFrameOffset}"
+        )
+
+    # ------------------------------------------------------------------
+    #  Frame discovery (with caching)
+    # ------------------------------------------------------------------
     def _getCachePath(self) -> Path:
-        """Get the path to the cache file for this dataset."""
-        # Create a hash of the data root to make cache file unique
         rootHash = hashlib.md5(str(self.dataRoot.resolve()).encode()).hexdigest()[:8]
-        return self.dataRoot / f".viddetr_cache_{rootHash}.json"
-    
+        return self.dataRoot / f".video_dataset_cache_{rootHash}.json"
+
     def _isCacheValid(self, cachePath: Path) -> bool:
-        """Check if the cache file is valid and up-to-date."""
         if not cachePath.exists():
             return False
-        
         try:
-            with open(cachePath, 'r') as f:
+            with open(cachePath, "r") as f:
                 cache = json.load(f)
-            
-            # Check cache version
-            if cache.get('version') != CACHE_VERSION:
-                print(f"[VideoSequenceDataset] Cache version mismatch, rebuilding...")
+            if cache.get("version") != CACHE_VERSION:
                 return False
-            
-            # Check if directories have been modified
-            cacheTime = cache.get('timestamp', 0)
-            imgsDirMtime = os.path.getmtime(self.imagesDir)
-            labelsDirMtime = os.path.getmtime(self.labelsDir)
-            
-            if imgsDirMtime > cacheTime or labelsDirMtime > cacheTime:
-                print(f"[VideoSequenceDataset] Dataset modified since cache, rebuilding...")
+            cacheTime = cache.get("timestamp", 0)
+            if os.path.getmtime(self.imagesDir) > cacheTime:
                 return False
-            
             return True
-        except (json.JSONDecodeError, KeyError, OSError) as e:
-            print(f"[VideoSequenceDataset] Cache read error: {e}, rebuilding...")
+        except (json.JSONDecodeError, KeyError, OSError):
             return False
-    
-    def _loadOrDiscoverSequences(self) -> Dict[str, List[int]]:
-        """Load sequences from cache or discover them from disk."""
+
+    def _loadOrDiscoverFrames(self) -> List[Path]:
         cachePath = self._getCachePath()
-        
         if self.useCache and self._isCacheValid(cachePath):
-            print(f"[VideoSequenceDataset] Loading from cache: {cachePath}")
-            with open(cachePath, 'r') as f:
+            print(f"[VideoDataset] Loading frame list from cache: {cachePath}")
+            with open(cachePath, "r") as f:
                 cache = json.load(f)
-            sequences = {k: v for k, v in cache['sequences'].items()}
-            # Filter sequences with enough frames
-            sequences = {
-                seqId: frames 
-                for seqId, frames in sequences.items() 
-                if len(frames) >= self.numFrames
-            }
-            return sequences
-        
-        # Discover sequences from disk
-        print(f"[VideoSequenceDataset] Scanning dataset directory...")
-        sequences = self._discoverSequences()
-        
-        # Save to cache
-        if self.useCache:
-            self._saveCache(cachePath, sequences)
-        
-        return sequences
-    
-    def _saveCache(self, cachePath: Path, sequences: Dict[str, List[int]]) -> None:
-        """Save discovered sequences to cache file."""
+            return [Path(p) for p in cache["frames"]]
+
+        print(f"[VideoDataset] Scanning {self.imagesDir} ...")
+        frames = self._discoverFrames()
+
+        if self.useCache and frames:
+            self._saveCache(cachePath, frames)
+        return frames
+
+    def _discoverFrames(self) -> List[Path]:
+        """Return image paths sorted alphabetically (= temporal order)."""
+        extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        frames = sorted(
+            p for p in self.imagesDir.iterdir()
+            if p.suffix.lower() in extensions
+        )
+        return frames
+
+    def _saveCache(self, cachePath: Path, frames: List[Path]) -> None:
         try:
-            # Include all sequences in cache (before filtering by numFrames)
-            # so cache can be reused with different numFrames settings
-            allSequences = self._discoverSequencesUnfiltered()
-            
             cache = {
-                'version': CACHE_VERSION,
-                'timestamp': max(
-                    os.path.getmtime(self.imagesDir),
-                    os.path.getmtime(self.labelsDir)
-                ),
-                'dataRoot': str(self.dataRoot.resolve()),
-                'numSequences': len(allSequences),
-                'sequences': allSequences
+                "version": CACHE_VERSION,
+                "timestamp": os.path.getmtime(self.imagesDir),
+                "numFrames": len(frames),
+                "frames": [str(p) for p in frames],
             }
-            
-            with open(cachePath, 'w') as f:
+            with open(cachePath, "w") as f:
                 json.dump(cache, f)
-            
-            print(f"[VideoSequenceDataset] Cache saved: {cachePath}")
+            print(f"[VideoDataset] Cache saved: {cachePath}")
         except OSError as e:
-            print(f"[VideoSequenceDataset] Failed to save cache: {e}")
-    
-    def _discoverSequencesUnfiltered(self) -> Dict[str, List[int]]:
-        """Discover all sequences without filtering by numFrames."""
-        sequences = {}
-        imageExtensions = {'.jpg', '.jpeg', '.png', '.bmp'}
-        
-        for imgFile in self.imagesDir.iterdir():
-            if imgFile.suffix.lower() not in imageExtensions:
-                continue
-            
-            match = self.FILENAME_PATTERN.match(imgFile.stem)
-            if not match:
-                continue
-            
-            seqId = match.group(1)
-            frameIdx = int(match.group(2))
-            
-            labelFile = self.labelsDir / f"seq_{seqId}_frame_{frameIdx:04d}.txt"
-            if not labelFile.exists():
-                continue
-            
-            if seqId not in sequences:
-                sequences[seqId] = []
-            sequences[seqId].append(frameIdx)
-        
-        for seqId in sequences:
-            sequences[seqId] = sorted(sequences[seqId])
-        
-        return sequences
-    
-    def _discoverSequences(self) -> Dict[str, List[int]]:
-        """
-        Discover all sequences and their available frame indices.
-        
-        Returns:
-            Dictionary mapping sequence ID to list of frame indices
-        """
-        sequences = self._discoverSequencesUnfiltered()
-        
-        # Filter sequences with enough frames
-        sequences = {
-            seqId: frames 
-            for seqId, frames in sequences.items() 
-            if len(frames) >= self.numFrames
-        }
-        
-        return sequences
-    
-    def _sampleFrameIndices(self, availableFrames: List[int]) -> List[int]:
-        """
-        Sample frame indices from available frames with controlled spread.
-        
-        This ensures temporal diversity while maintaining reasonable motion
-        between frames. Uses stratified sampling for better coverage.
-        
-        Args:
-            availableFrames: List of available frame indices in the sequence
-            
-        Returns:
-            List of sampled frame indices (sorted)
-        """
-        numAvailable = len(availableFrames)
-        
-        if self.imageSet == 'train':
-            # Training: Random sampling with controlled gaps
-            # Strategy: Divide available frames into numFrames segments,
-            # then randomly sample one frame from each segment
-            
-            segmentSize = numAvailable // self.numFrames
-            sampledFrames = []
-            
-            for i in range(self.numFrames):
-                segmentStart = i * segmentSize
-                segmentEnd = (i + 1) * segmentSize if i < self.numFrames - 1 else numAvailable
-                
-                # Random frame from this segment
-                frameIdx = random.randint(segmentStart, segmentEnd - 1)
-                sampledFrames.append(availableFrames[frameIdx])
-            
-            # Additional randomization: sometimes shuffle the order
-            # (disabled for now to maintain temporal order)
-            
-        else:
-            # Validation: Uniform sampling for reproducibility
-            step = (numAvailable - 1) / (self.numFrames - 1) if self.numFrames > 1 else 0
-            sampledFrames = [
-                availableFrames[min(int(i * step), numAvailable - 1)]
-                for i in range(self.numFrames)
-            ]
-        
-        return sorted(sampledFrames)
-    
-    def _loadImage(self, seqId: str, frameIdx: int) -> Image.Image:
-        """Load a single image from the dataset.
-        
-        Eagerly loads pixel data and closes the file handle to avoid
-        leaking file descriptors in multiprocessing workers.
-        """
-        imgPath = self.imagesDir / f"seq_{seqId}_frame_{frameIdx:04d}.jpg"
-        
-        # Try different extensions if .jpg doesn't exist
-        if not imgPath.exists():
-            for ext in ['.png', '.jpeg', '.bmp']:
-                altPath = imgPath.with_suffix(ext)
-                if altPath.exists():
-                    imgPath = altPath
-                    break
-        
-        # Open, force pixel decode, then close the file handle.
-        # PIL uses lazy loading by default — the underlying file stays open
-        # until .load() is called. In DataLoader workers this leaks FDs.
-        with Image.open(imgPath) as img:
-            img.load()  # force full decode into memory
-            return img.convert('RGB')
-    
+            print(f"[VideoDataset] Failed to save cache: {e}")
+
+    # ------------------------------------------------------------------
+    #  Label loading
+    # ------------------------------------------------------------------
+    def _getLabelPath(self, imagePath: Path) -> Path:
+        """Derive label file path from image path (same stem, .txt)."""
+        return self.labelsDir / (imagePath.stem + ".txt")
+
     def _loadLabels(
-        self, 
-        seqId: str, 
-        frameIdx: int,
-        imgWidth: int,
-        imgHeight: int
+        self, labelPath: Path
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Load labels for a single frame.
-        
-        Args:
-            seqId: Sequence identifier
-            frameIdx: Frame index
-            imgWidth: Image width for denormalization
-            imgHeight: Image height for denormalization
-            
+        Parse a label file.
+
+        Each line: ``track_id  class_id  cx  cy  w  h`` (normalised).
+
         Returns:
-            Tuple of (boxes, labels, trackIds) where:
-            - boxes: [N, 4] tensor in cxcywh format (normalized)
-            - labels: [N] tensor of class indices
-            - trackIds: [N] tensor of tracking IDs (line numbers)
+            boxes    : [N, 4]  cxcywh normalised
+            labels   : [N]     class indices
+            trackIds : [N]     track identity
         """
-        labelPath = self.labelsDir / f"seq_{seqId}_frame_{frameIdx:04d}.txt"
-        
-        boxes = []
-        labels = []
-        trackIds = []
-        
+        boxes, labels, trackIds = [], [], []
+
         if labelPath.exists():
-            with open(labelPath, 'r') as f:
-                for lineIdx, line in enumerate(f):
+            with open(labelPath, "r") as f:
+                for line in f:
                     line = line.strip()
                     if not line:
                         continue
-                    
                     parts = line.split()
-                    if len(parts) < 5:
+                    if len(parts) < 6:
                         continue
-                    
-                    # YOLO format: class_id cx cy w h (normalized)
-                    classId = int(parts[0])
-                    cx = float(parts[1])
-                    cy = float(parts[2])
-                    w = float(parts[3])
-                    h = float(parts[4])
-                    
-                    # Validate coordinates
+
+                    tid = int(parts[0])
+                    cid = int(parts[1])
+                    cx = float(parts[2])
+                    cy = float(parts[3])
+                    w = float(parts[4])
+                    h = float(parts[5])
+
+                    # Basic sanity
                     if not (0 <= cx <= 1 and 0 <= cy <= 1 and 0 < w <= 1 and 0 < h <= 1):
                         continue
-                    
-                    # Skip boxes that are too small (both w and h below threshold)
                     if self.minBoxSize > 0 and w < self.minBoxSize and h < self.minBoxSize:
                         continue
-                    
+
                     boxes.append([cx, cy, w, h])
-                    labels.append(classId)
-                    trackIds.append(lineIdx)  # Line number = track ID
-        
+                    labels.append(cid)
+                    trackIds.append(tid)
+
         if boxes:
-            boxes = torch.tensor(boxes, dtype=torch.float32)
-            labels = torch.tensor(labels, dtype=torch.int64)
-            trackIds = torch.tensor(trackIds, dtype=torch.int64)
+            return (
+                torch.tensor(boxes, dtype=torch.float32),
+                torch.tensor(labels, dtype=torch.int64),
+                torch.tensor(trackIds, dtype=torch.int64),
+            )
+        return (
+            torch.zeros((0, 4), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.int64),
+            torch.zeros((0,), dtype=torch.int64),
+        )
+
+    # ------------------------------------------------------------------
+    #  Image loading
+    # ------------------------------------------------------------------
+    def _loadImage(self, imgPath: Path) -> Image.Image:
+        with Image.open(imgPath) as img:
+            img.load()
+            return img.convert("RGB")
+
+    # ------------------------------------------------------------------
+    #  Coordinate conversion
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _cxcywhToXyxy(
+        boxes: torch.Tensor, imgW: int, imgH: int
+    ) -> torch.Tensor:
+        """Normalised cxcywh → absolute xyxy."""
+        cx, cy, w, h = boxes.unbind(-1)
+        cx, w = cx * imgW, w * imgW
+        cy, h = cy * imgH, h * imgH
+        return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
+
+    # ------------------------------------------------------------------
+    #  Sampling
+    # ------------------------------------------------------------------
+    def _sampleIndices(self) -> List[int]:
+        """Sample frame indices according to the configured strategy."""
+        if self.samplingStrategy in ("random_walk", "mixed"):
+            fn = SAMPLING_STRATEGIES[self.samplingStrategy]
+            return fn(self.numFrames, self.totalFrames, self.maxFrameOffset)
+        elif self.samplingStrategy == "exponential_stride":
+            return _sampleExponentialStride(
+                self.numFrames, self.totalFrames, minGap=0, maxGap=self.maxFrameOffset
+            )
         else:
-            # Empty annotations
-            boxes = torch.zeros((0, 4), dtype=torch.float32)
-            labels = torch.zeros((0,), dtype=torch.int64)
-            trackIds = torch.zeros((0,), dtype=torch.int64)
-        
-        return boxes, labels, trackIds
-    
+            raise ValueError(f"Unknown sampling strategy: {self.samplingStrategy}")
+
+    def _sampleIndicesVal(self) -> List[int]:
+        """Deterministic uniform sampling for validation."""
+        if self.totalFrames <= self.numFrames:
+            indices = list(range(self.totalFrames))
+            while len(indices) < self.numFrames:
+                indices.append(indices[-1])
+            return indices
+        step = (self.totalFrames - 1) / (self.numFrames - 1)
+        return [min(int(i * step), self.totalFrames - 1) for i in range(self.numFrames)]
+
+    # ------------------------------------------------------------------
+    #  Dataset interface
+    # ------------------------------------------------------------------
     def __len__(self) -> int:
-        """Return number of sequences in the dataset."""
-        return len(self.sequenceIds)
-    
-    def __getitem__(self, idx: int) -> Tuple[List[torch.Tensor], List[Dict]]:
+        return self._epochLength
+
+    def __getitem__(
+        self, idx: int
+    ) -> Tuple[List[torch.Tensor], List[Dict[str, Any]]]:
         """
-        Get a sample consisting of N frames and their annotations.
-        
-        Args:
-            idx: Index of the sequence to load
-            
-        Returns:
-            Tuple of (images, targets) where:
-            - images: List of N image tensors [3, H, W]
-            - targets: List of N target dicts, each containing:
-                - boxes: [M, 4] bounding boxes in cxcywh format
-                - labels: [M] class labels
-                - trackIds: [M] tracking IDs for cross-frame association
-                - frameIdx: Frame index within the clip (0 to N-1)
-                - origSize: Original image size [H, W]
-                - size: Current image size [H, W]
-                - imageId: Unique identifier for this frame
-                - seqId: Sequence identifier
+        Return a clip of ``numFrames`` frames with annotations.
+
+        The ``idx`` is **ignored** for training (we always do random
+        sampling from the full sequence).  For validation, we use
+        deterministic sampling seeded by ``idx`` to ensure reproducibility.
         """
-        seqId = self.sequenceIds[idx]
-        availableFrames = self.sequences[seqId]
-        
-        # Sample frame indices
-        sampledFrames = self._sampleFrameIndices(availableFrames)
-        
+        if self.totalFrames == 0:
+            raise RuntimeError(
+                f"[VideoDataset] No frames found in {self.imagesDir}. "
+                "Cannot produce samples from an empty dataset."
+            )
+
+        if self.imageSet == "train":
+            frameIndices = self._sampleIndices()
+        else:
+            # Deterministic per-sample: seed from idx so each val sample
+            # covers a different part of the video.
+            rng = random.Random(idx)
+            start = rng.randint(0, max(0, self.totalFrames - 1))
+            frameIndices = []
+            cur = start
+            for _ in range(self.numFrames):
+                frameIndices.append(min(cur, self.totalFrames - 1))
+                cur += rng.randint(0, self.maxFrameOffset)
+
         images = []
         targets = []
-        
-        for clipFrameIdx, frameIdx in enumerate(sampledFrames):
-            # Load image
-            img = self._loadImage(seqId, frameIdx)
-            imgWidth, imgHeight = img.size
-            
-            # Load labels
-            boxes, labels, trackIds = self._loadLabels(
-                seqId, frameIdx, imgWidth, imgHeight
-            )
-            
-            # Prepare target dict
-            # Note: We need 'iscrowd' and 'area' fields for DETR transforms compatibility
+
+        for clipIdx, fIdx in enumerate(frameIndices):
+            imgPath = self.framePaths[fIdx]
+            img = self._loadImage(imgPath)
+            imgW, imgH = img.size
+
+            labelPath = self._getLabelPath(imgPath)
+            boxes, labels, trackIds = self._loadLabels(labelPath)
             numBoxes = len(boxes)
-            
-            # Compute area from normalized cxcywh boxes (w * h * imgW * imgH)
+
+            # Area (in absolute pixels) from normalised cxcywh
             if numBoxes > 0:
-                # boxes are in cxcywh normalized format
-                area = boxes[:, 2] * boxes[:, 3] * imgWidth * imgHeight
+                area = boxes[:, 2] * boxes[:, 3] * imgW * imgH
             else:
                 area = torch.zeros((0,), dtype=torch.float32)
-            
-            target = {
-                'boxes': boxes,  # cxcywh normalized
-                'labels': labels,
-                'trackIds': trackIds,
-                'iscrowd': torch.zeros((numBoxes,), dtype=torch.int64),  # No crowd annotations
-                'area': area,
-                'frameIdx': torch.tensor([clipFrameIdx]),
-                'origSize': torch.tensor([imgHeight, imgWidth]),
-                'size': torch.tensor([imgHeight, imgWidth]),
-                'imageId': torch.tensor([int(seqId) * 10000 + frameIdx]),
-                'seqId': seqId,
-                'seqFrameIdx': frameIdx,
+
+            target: Dict[str, Any] = {
+                "boxes": boxes,        # cxcywh normalised — converted below
+                "labels": labels,
+                "trackIds": trackIds,
+                "iscrowd": torch.zeros((numBoxes,), dtype=torch.int64),
+                "area": area,
+                "frameIdx": torch.tensor([clipIdx]),
+                "origSize": torch.as_tensor([imgH, imgW]),
+                "size": torch.as_tensor([imgH, imgW]),
+                "imageId": torch.tensor([fIdx]),
+                "seqId": "video",
+                "seqFrameIdx": fIdx,
             }
-            
-            # Convert boxes from cxcywh to xyxy for transforms (then back)
+
+            # Convert normalised cxcywh → absolute xyxy for DETR transforms
             if numBoxes > 0:
-                # Convert normalized cxcywh to absolute xyxy for transforms
-                boxesXyxy = self._cxcywhToXyxy(boxes, imgWidth, imgHeight)
-                target['boxes'] = boxesXyxy
-            
-            # Apply transforms
+                target["boxes"] = self._cxcywhToXyxy(boxes, imgW, imgH)
+
+            # Apply transforms (resize, flip, normalise, …)
             if self.transforms is not None:
                 img, target = self.transforms(img, target)
-            
+
             images.append(img)
             targets.append(target)
-        
+
         return images, targets
-    
-    def _cxcywhToXyxy(
-        self, 
-        boxes: torch.Tensor, 
-        imgWidth: int, 
-        imgHeight: int
-    ) -> torch.Tensor:
-        """
-        Convert boxes from normalized cxcywh to absolute xyxy format.
-        
-        Args:
-            boxes: [N, 4] tensor in normalized cxcywh format
-            imgWidth: Image width
-            imgHeight: Image height
-            
-        Returns:
-            [N, 4] tensor in absolute xyxy format
-        """
-        cx, cy, w, h = boxes.unbind(-1)
-        
-        # Denormalize
-        cx = cx * imgWidth
-        cy = cy * imgHeight
-        w = w * imgWidth
-        h = h * imgHeight
-        
-        # Convert to xyxy
-        x1 = cx - w / 2
-        y1 = cy - h / 2
-        x2 = cx + w / 2
-        y2 = cy + h / 2
-        
-        return torch.stack([x1, y1, x2, y2], dim=-1)
 
 
-def makeVideoTransforms(imageSet: str, maxSize: int = 800):
+# ======================================================================
+#  Transforms  (reuse the same recipe as other datasets)
+# ======================================================================
+
+def makeVideoDatasetTransforms(imageSet: str, maxSize: int = 800):
     """
-    Create transforms for video dataset.
-    
-    Note: We use simpler transforms than DETR because we need consistency
-    across frames in a clip. Heavy augmentation is applied at the clip level.
-    
-    Args:
-        imageSet: 'train' or 'val'
-        maxSize: Maximum image size
-        
-    Returns:
-        Composed transforms
+    Create DETR-compatible transforms for the VideoDataset.
+
+    Identical recipe to ``makeVideoTransforms`` / ``makeTaoTransforms``
+    so that datasets are interchangeable.
     """
     normalize = T.Compose([
         T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
-    
+
     scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
-    
-    if imageSet == 'train':
+
+    if imageSet == "train":
         return T.Compose([
             T.RandomHorizontalFlip(),
             T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
@@ -529,144 +529,157 @@ def makeVideoTransforms(imageSet: str, maxSize: int = 800):
                     T.RandomResize([400, 500, 600]),
                     T.RandomSizeCrop(384, 600),
                     T.RandomResize(scales, max_size=maxSize),
-                ])
+                ]),
             ),
             normalize,
             T.RandomErasing(p=0.1),
         ])
-    
-    if imageSet == 'val':
+
+    if imageSet == "val":
         return T.Compose([
             T.RandomResize([800], max_size=maxSize),
             normalize,
         ])
-    
+
     raise ValueError(f"Unknown image set: {imageSet}")
 
 
-def videoCollateFn(batch: List[Tuple]) -> Tuple[List[Any], List[List[Dict]]]:
+# ======================================================================
+#  Collate  — reuse videoCollateFn (identical output format)
+# ======================================================================
+
+def videoDatasetCollateFn(
+    batch: List[Tuple],
+) -> Tuple[List[Any], List[List[Dict]]]:
     """
-    Collate function for video batches.
-    
-    Unlike standard DETR collate, we handle sequences of frames.
-    
-    Args:
-        batch: List of (images, targets) tuples where images is a list of N tensors
-        
-    Returns:
-        Tuple of (nestedTensorList, targetsList) where:
-        - nestedTensorList: List of N NestedTensors, each of shape [B, 3, H, W]
-        - targetsList: List of N lists of target dicts
+    Collate function for ``VideoDataset`` batches.
+
+    Output format is identical to ``videoCollateFn`` /
+    ``taoCollateFn``, so we simply delegate.
     """
-    # Import NestedTensor utilities
-    from vidDetr.util.misc import nested_tensor_from_tensor_list
-    
-    # Unzip batch
-    imagesBatch = [item[0] for item in batch]  # List of B lists of N tensors
-    targetsBatch = [item[1] for item in batch]  # List of B lists of N dicts
-    
-    batchSize = len(imagesBatch)
-    numFrames = len(imagesBatch[0])
-    
-    # Reorganize: from [B, N] to [N, B]
-    framesPerTimestep = []
-    targetsPerTimestep = []
-    
-    for frameIdx in range(numFrames):
-        # Collect all images for this frame across batch
-        frameImages = [imagesBatch[b][frameIdx] for b in range(batchSize)]
-        frameTargets = [targetsBatch[b][frameIdx] for b in range(batchSize)]
-        
-        # Create NestedTensor for this frame
-        nestedTensor = nested_tensor_from_tensor_list(frameImages)
-        
-        framesPerTimestep.append(nestedTensor)
-        targetsPerTimestep.append(frameTargets)
-    
-    return framesPerTimestep, targetsPerTimestep
+    from vidDetr.datasets.simulated_video_dataset import videoCollateFn
+    return videoCollateFn(batch)
 
 
-def buildVideoDataset(args) -> Tuple[Dataset, Optional[Dataset]]:
+# ======================================================================
+#  Builder
+# ======================================================================
+
+def buildVideoDatasetFromArgs(
+    args,
+) -> Tuple[Dataset, Optional[Dataset]]:
     """
-    Build train and validation datasets from args.
-    
-    Args:
-        args: Argument namespace with dataset configuration.
-              If ``args.mergeTrainVal`` is True, the validation split is
-              loaded with training augmentations, concatenated with the
-              training split, and returned as ``(mergedDataset, None)``.
-        
+    Build train and (optionally) validation ``VideoDataset`` instances.
+
+    Expected ``args`` attributes:
+        videoDataRoot       : str  — root containing ``train/`` and ``val/``
+        numFrames           : int
+        maxSize             : int
+        numClasses          : int
+        batchSize           : int
+        videoTrainBatches   : int  — batches per training epoch  (default 1000)
+        videoValBatches     : int  — batches per validation epoch (default 50)
+        videoMaxFrameOffset : int  — max gap between consecutive frames (default 30)
+        videoSamplingStrategy : str — sampling strategy name
+        minBoxSize          : float
+        mergeTrainVal       : bool
+
     Returns:
-        Tuple of (trainDataset, valDataset).  ``valDataset`` is ``None``
-        when ``mergeTrainVal`` is enabled.
+        (trainDataset, valDataset).  ``valDataset`` is ``None`` when the
+        val split is empty or ``mergeTrainVal`` is ``True``.
     """
-    # Load data config from yaml
-    dataConfigPath = Path(args.dataConfig)
-    with open(dataConfigPath, 'r') as f:
-        dataConfig = yaml.safe_load(f)
-    
-    trainRoot = dataConfig.get('train', '')
-    valRoot = dataConfig.get('val', '')
-    classNames = list(dataConfig.get('names', {}).values())
-    
-    # Replace 'images' suffix to get root directory
-    if trainRoot.endswith('/images'):
-        trainRoot = trainRoot[:-7]
-    if valRoot.endswith('/images'):
-        valRoot = valRoot[:-7]
-    
-    mergeTrainVal = getattr(args, 'mergeTrainVal', False)
-    
-    # Build datasets
-    trainTransforms = makeVideoTransforms('train', maxSize=args.maxSize)
-    
-    minBoxSize = getattr(args, 'minBoxSize', 0.0)
-    
-    trainDataset = VideoSequenceDataset(
-        dataRoot=trainRoot,
+    root = Path(args.videoDataRoot)
+    trainRoot = root / "train"
+    valRoot = root / "val"
+
+    maxSize = getattr(args, "maxSize", 800)
+    minBoxSize = getattr(args, "minBoxSize", 0.0)
+    mergeTrainVal = getattr(args, "mergeTrainVal", False)
+
+    trainBatches = getattr(args, "videoTrainBatches", 1000)
+    valBatches = getattr(args, "videoValBatches", 50)
+    maxOffset = getattr(args, "videoMaxFrameOffset", 30)
+    strategy = getattr(args, "videoSamplingStrategy", "mixed")
+    batchSize = getattr(args, "batchSize", 32)
+
+    # Load class names from dataConfig if available.
+    classNames = None
+    dataConfigPath = getattr(args, "dataConfig", None)
+    if dataConfigPath and Path(dataConfigPath).exists():
+        with open(dataConfigPath, "r") as f:
+            dataConfig = yaml.safe_load(f)
+        classNames = list(dataConfig.get("names", {}).values())
+
+    trainTransforms = makeVideoDatasetTransforms("train", maxSize=maxSize)
+    trainDataset = VideoDataset(
+        dataRoot=str(trainRoot),
         numFrames=args.numFrames,
         transforms=trainTransforms,
-        imageSet='train',
-        framesPerSequence=args.framesPerSequence,
-        minFrameGap=args.minFrameGap,
-        maxFrameGap=args.maxFrameGap,
+        imageSet="train",
+        batchesPerEpoch=trainBatches,
+        batchSize=batchSize,
+        maxFrameOffset=maxOffset,
+        samplingStrategy=strategy,
         classNames=classNames,
+        numClasses=args.numClasses,
         minBoxSize=minBoxSize,
     )
-    
+
     if mergeTrainVal:
-        # Load validation split with *train* transforms so it acts as
-        # additional training data.
-        valAsTrainDataset = VideoSequenceDataset(
-            dataRoot=valRoot,
-            numFrames=args.numFrames,
-            transforms=trainTransforms,
-            imageSet='train',   # use train augmentations & sampling
-            framesPerSequence=args.framesPerSequence,
-            minFrameGap=args.minFrameGap,
-            maxFrameGap=args.maxFrameGap,
-            classNames=classNames,
-            minBoxSize=minBoxSize,
-        )
-        merged = torch.utils.data.ConcatDataset([trainDataset, valAsTrainDataset])
-        print(
-            f"[buildVideoDataset] mergeTrainVal: {len(trainDataset)} + "
-            f"{len(valAsTrainDataset)} = {len(merged)} sequences"
-        )
-        return merged, None
-    
-    valTransforms = makeVideoTransforms('val', maxSize=args.maxSize)
-    
-    valDataset = VideoSequenceDataset(
-        dataRoot=valRoot,
+        # Check if val has any frames before trying to merge.
+        valImagesDir = valRoot / "images"
+        if valImagesDir.exists() and any(valImagesDir.iterdir()):
+            valAsTrainDataset = VideoDataset(
+                dataRoot=str(valRoot),
+                numFrames=args.numFrames,
+                transforms=trainTransforms,
+                imageSet="train",
+                batchesPerEpoch=valBatches,
+                batchSize=batchSize,
+                maxFrameOffset=maxOffset,
+                samplingStrategy=strategy,
+                classNames=classNames,
+                numClasses=args.numClasses,
+                minBoxSize=minBoxSize,
+            )
+            merged = torch.utils.data.ConcatDataset([trainDataset, valAsTrainDataset])
+            print(
+                f"[buildVideoDataset] mergeTrainVal: {len(trainDataset)} + "
+                f"{len(valAsTrainDataset)} = {len(merged)} samples"
+            )
+            return merged, None
+        else:
+            print("[buildVideoDataset] mergeTrainVal: val is empty, using train only")
+            return trainDataset, None
+
+    # Build val dataset — gracefully handle empty val dir.
+    valImagesDir = valRoot / "images"
+    if not valImagesDir.exists():
+        print("[buildVideoDataset] val/images/ not found — skipping validation")
+        return trainDataset, None
+
+    valHasFrames = any(
+        p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        for p in valImagesDir.iterdir()
+    ) if valImagesDir.exists() else False
+
+    if not valHasFrames:
+        print("[buildVideoDataset] val/images/ is empty — skipping validation")
+        return trainDataset, None
+
+    valTransforms = makeVideoDatasetTransforms("val", maxSize=maxSize)
+    valDataset = VideoDataset(
+        dataRoot=str(valRoot),
         numFrames=args.numFrames,
         transforms=valTransforms,
-        imageSet='val',
-        framesPerSequence=args.framesPerSequence,
-        minFrameGap=args.minFrameGap,
-        maxFrameGap=args.maxFrameGap,
+        imageSet="val",
+        batchesPerEpoch=valBatches,
+        batchSize=batchSize,
+        maxFrameOffset=maxOffset,
+        samplingStrategy=strategy,  # val uses deterministic sampling anyway
         classNames=classNames,
+        numClasses=args.numClasses,
         minBoxSize=minBoxSize,
     )
-    
+
     return trainDataset, valDataset

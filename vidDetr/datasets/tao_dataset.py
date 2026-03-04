@@ -34,6 +34,7 @@ import hashlib
 import json
 import math
 import os
+from pathlib import Path
 import random
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -547,7 +548,7 @@ def taoCollateFn(batch: List[Tuple]) -> Tuple[List[Any], List[List[Dict]]]:
     The per-sample format is identical to ``VideoSequenceDataset``, so we
     simply delegate to ``videoCollateFn``.
     """
-    from vidDetr.datasets.video_dataset import videoCollateFn
+    from vidDetr.datasets.simulated_video_dataset import videoCollateFn
     return videoCollateFn(batch)
 
 

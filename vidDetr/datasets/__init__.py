@@ -2,10 +2,12 @@
 #
 # Provides dataset classes for video object detection and tracking.
 
-from .video_dataset import VideoSequenceDataset, buildVideoDataset, videoCollateFn
+from .simulated_video_dataset import SimulatedVideoSequenceDataset, buildVideoDataset, videoCollateFn
 from .tao_dataset import TaoDataset, buildTaoDataset, taoCollateFn
+from .video_dataset import VideoDataset, buildVideoDatasetFromArgs, videoDatasetCollateFn
 
 __all__ = [
-    'VideoSequenceDataset', 'buildVideoDataset', 'videoCollateFn',
+    'SimulatedVideoSequenceDataset', 'buildVideoDataset', 'videoCollateFn',
     'TaoDataset', 'buildTaoDataset', 'taoCollateFn',
+    'VideoDataset', 'buildVideoDatasetFromArgs', 'videoDatasetCollateFn',
 ]
