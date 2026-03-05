@@ -312,3 +312,107 @@ class Compose(object):
             format_string += "    {0}".format(t)
         format_string += "\n)"
         return format_string
+
+
+class SmartSquareCrop(object):
+    """
+    Crop a wide (e.g. 16:9) image toward a 1:1 aspect ratio without
+    losing any annotated objects.
+
+    Algorithm:
+    1. Compute the tight bounding rectangle of **all** GT boxes (absolute
+       xyxy) plus a configurable ``margin`` (fraction of the box span).
+    2. Determine the target crop size: ``min(imgW, imgH)`` (i.e. the
+       shorter side) — this would give a perfect square.
+    3. Along the longer axis, try to centre the crop on the GT centroid.
+       If the GT extent (with margin) is wider than the target crop, the
+       crop is enlarged to cover the full GT extent — the result will not
+       be perfectly square, but no objects are lost.
+    4. Clamp the crop window to image boundaries.
+    5. Along the shorter axis the full extent is always kept (no crop).
+
+    The crop is applied using the existing ``crop()`` function which
+    correctly adjusts boxes, area, masks, etc.
+
+    If there are **no** GT boxes the image is centre-cropped to a square.
+
+    Args:
+        margin: Fraction of the GT span to add as padding on each side
+                (default 0.15 — 15 % breathing room).
+        randomise_pos: If ``True`` (default) the crop position along the
+                       long axis is jittered randomly within the valid
+                       range (between the position that just covers all
+                       GT boxes on the left and the one that just covers
+                       them on the right).  If ``False`` the crop is
+                       centred on the GT centroid.
+    """
+
+    def __init__(self, margin: float = 0.15, randomise_pos: bool = True):
+        self.margin = margin
+        self.randomise_pos = randomise_pos
+
+    def __call__(self, img, target):
+        imgW, imgH = img.size  # PIL: (width, height)
+
+        # Already square or taller-than-wide → nothing to do on width axis
+        if imgW <= imgH:
+            return img, target
+
+        # Target crop width = image height (perfect square)
+        targetW = imgH
+
+        # --- Compute GT extent along x (boxes are absolute xyxy) --------
+        if "boxes" in target and len(target["boxes"]) > 0:
+            boxes = target["boxes"]  # [N, 4] absolute xyxy
+            gtLeft = boxes[:, 0].min().item()
+            gtRight = boxes[:, 2].max().item()
+            gtSpanX = gtRight - gtLeft
+            gtCentreX = (gtLeft + gtRight) / 2.0
+
+            # Add margin (fraction of GT span, at least 10 px each side)
+            pad = max(gtSpanX * self.margin, 10.0)
+            neededLeft = gtLeft - pad
+            neededRight = gtRight + pad
+            neededW = neededRight - neededLeft
+
+            # If GT span + margin is wider than targetW, enlarge the crop
+            cropW = max(targetW, int(neededW + 0.5))
+            # But never exceed image width
+            cropW = min(cropW, imgW)
+
+            # Determine valid horizontal offset range
+            # The crop window [cropLeft, cropLeft + cropW] must contain
+            # [neededLeft, neededRight] and be within [0, imgW].
+            # cropLeft <= neededLeft  and  cropLeft + cropW >= neededRight
+            maxCropLeft = max(0, int(neededLeft))
+            minCropLeft = max(0, min(int(neededRight - cropW), maxCropLeft))
+            # Also clamp so crop doesn't go past image right edge
+            maxCropLeft = min(maxCropLeft, imgW - cropW)
+            minCropLeft = min(minCropLeft, maxCropLeft)
+
+            if self.randomise_pos and maxCropLeft > minCropLeft:
+                cropLeft = random.randint(minCropLeft, maxCropLeft)
+            else:
+                # Centre on GT centroid, then clamp
+                cropLeft = int(gtCentreX - cropW / 2.0)
+                cropLeft = max(0, min(cropLeft, imgW - cropW))
+                # Ensure all GT boxes are inside
+                cropLeft = min(cropLeft, max(0, int(neededLeft)))
+                cropLeft = max(cropLeft, int(neededRight - cropW))
+                cropLeft = max(0, min(cropLeft, imgW - cropW))
+        else:
+            # No GT boxes — centre crop
+            cropW = targetW
+            cropLeft = (imgW - cropW) // 2
+
+        # Crop height = full image height (no vertical crop for wide images)
+        cropTop = 0
+        cropH = imgH
+
+        # region = (top, left, height, width) as expected by F.crop / crop()
+        region = (cropTop, cropLeft, cropH, cropW)
+        return crop(img, target, region)
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}("
+                f"margin={self.margin}, randomise_pos={self.randomise_pos})")
