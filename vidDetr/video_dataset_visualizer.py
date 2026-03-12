@@ -28,9 +28,9 @@ from vidDetr.datasets.video_dataset import VideoDataset, makeVideoDatasetTransfo
 # Default dataset root (same as --videoDataRoot in main.py)
 DEFAULT_DATA_ROOT = "/mnt/matylda5/xmihol00/datasets/climbing_videos"
 OUTPUT_DIR = "video_dataset_debug_frames"
-NUM_SAMPLES = 10
+NUM_SAMPLES = 50
 NUM_FRAMES = 4
-MAX_SIZE = 384  # same as --maxSize default in main.py
+MAX_SIZE = 512  # same as --maxSize default in main.py
 
 # ImageNet normalisation constants (for de-normalising tensors)
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)

@@ -522,25 +522,24 @@ def makeVideoDatasetTransforms(imageSet: str, maxSize: int = 800):
 
     if imageSet == "train":
         return T.Compose([
-            T.SmartSquareCrop(margin=0.15, randomise_pos=True),
-            T.RandomHorizontalFlip(),
+            #T.SmartSquareCrop(margin=0.15, randomise_pos=False),
             T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
             T.RandomGrayscale(p=0.05),
-            T.RandomSelect(
-                T.RandomResize(scales, max_size=maxSize),
-                T.Compose([
-                    T.RandomResize([400, 500, 600]),
-                    T.RandomSizeCrop(384, 600),
-                    T.RandomResize(scales, max_size=maxSize),
-                ]),
-            ),
+            T.RandomResize(scales, max_size=maxSize),
+            #T.RandomSelect(
+            #    T.Compose([
+            #        T.RandomResize([400, 500, 600]),
+            #        T.RandomSizeCrop(384, 600),
+            #        T.RandomResize(scales, max_size=maxSize),
+            #    ]),
+            #),
             normalize,
-            T.RandomErasing(p=0.1),
+            #T.RandomErasing(p=0.1),
         ])
 
     if imageSet == "val":
         return T.Compose([
-            T.SmartSquareCrop(margin=0.15, randomise_pos=False),
+            #T.SmartSquareCrop(margin=0.15, randomise_pos=False),
             T.RandomResize([800], max_size=maxSize),
             normalize,
         ])

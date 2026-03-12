@@ -143,7 +143,7 @@ def getArgsParser():
                         help='Base learning rate')
     parser.add_argument('--lrBackbone', default=1e-5, type=float,
                         help='Learning rate for backbone')
-    parser.add_argument('--batchSize', default=32, type=int,
+    parser.add_argument('--batchSize', default=20, type=int,
                         help='Batch size per GPU')
     parser.add_argument('--weightDecay', default=1e-4, type=float,
                         help='Weight decay')
@@ -232,7 +232,7 @@ def getArgsParser():
                         help='L1 box loss coefficient; per-epoch schedule')
     parser.add_argument('--giouLossCoef', default=[2.0], nargs='+', type=float,
                         help='GIoU loss coefficient; per-epoch schedule')
-    parser.add_argument('--eosCoef', default=[0.05, 0.1, 0.125, 0.15, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.3], nargs='+', type=float,
+    parser.add_argument('--eosCoef', default=[0.1, 0.11, 0.125, 0.15, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.3], nargs='+', type=float,
                         help='No-object class weight (higher = fewer false positives); per-epoch schedule')
     parser.add_argument('--trackingLossCoef', default=[1.0], nargs='+', type=float,
                         help='Tracking contrastive loss coefficient; per-epoch schedule')
@@ -254,7 +254,7 @@ def getArgsParser():
                         help='Coefficient for denoising losses (multiplied with base loss coefs); per-epoch schedule')
     
     # Duplicate suppression loss
-    parser.add_argument('--dupLossCoef', default=[0.0, 0.0, 0.0, 0.1, 0.25, 0.2, 0.15, 0.1, 0.05, 0.0], nargs='+', type=float,
+    parser.add_argument('--dupLossCoef', default=[0.0, 0.1, 0.25], nargs='+', type=float,
                         help='Weight for IoU-based duplicate suppression loss; per-epoch schedule')
     
     # EMA (Exponential Moving Average)
@@ -280,7 +280,7 @@ def getArgsParser():
                         help='Minimum gap between sampled frames')
     parser.add_argument('--maxFrameGap', default=10, type=int,
                         help='Maximum gap between sampled frames')
-    parser.add_argument('--maxSize', default=384, type=int,
+    parser.add_argument('--maxSize', default=640, type=int,
                         help='Maximum image size after transforms')
     parser.add_argument('--minBoxSize', default=0.00, type=float,
                         help='Minimum GT box size as fraction of image width or height; '

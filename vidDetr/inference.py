@@ -7,18 +7,25 @@ Runs inference on test video sequences, associates detections across frames
 using tracking embeddings, and visualises predictions vs. ground-truth with
 OpenCV.
 
-Usage:
+Usage (test directory with GT labels):
     python vidDetr/inference.py \
         --modelPath vidDetr_weights/video_detr_best.pth \
         --testDir test \
         --dataConfig vidDetr/data.yaml \
         --confidence 0.5
 
+Usage (video file – higher priority than --testDir, no GT labels):
+    python vidDetr/inference.py \
+        --modelPath vidDetr_weights/video_detr_best.pth \
+        --videoPath path/to/video.mp4 \
+        --dataConfig vidDetr/data.yaml \
+        --confidence 0.5
+
 Keys during visualisation:
     →  / d / SPACE  – next frame
     ←  / a          – previous frame
-    n               – next sequence
-    p               – previous sequence
+    n               – next sequence (testDir mode only)
+    p               – previous sequence (testDir mode only)
     q / ESC         – quit
 """
 
@@ -36,6 +43,10 @@ import torch
 import torch.nn.functional as F
 import yaml
 from PIL import Image
+
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from vidDetr.util.misc import NestedTensor, nested_tensor_from_tensor_list
 from vidDetr.datasets import transforms as T
@@ -62,7 +73,7 @@ def getArgsParser() -> argparse.ArgumentParser:
     # Required
     parser.add_argument(
         "--modelPath",
-        default="video_detr_best.pth",
+        default="checkpoint_latest.pth",
         type=str,
         help="Path to a VideoDETR checkpoint (.pth)",
     )
@@ -77,6 +88,14 @@ def getArgsParser() -> argparse.ArgumentParser:
         default="data.yaml",
         type=str,
         help="Path to data.yaml (used for class names)",
+    )
+    parser.add_argument(
+        "--videoPath",
+        default="/home/david/Documents/climbing/climbs1/2-C2-Auto+solo.mov",
+        type=str,
+        help="Path to a video file (.mp4, .avi, .mkv, …). When set, this "
+             "takes priority over --testDir. The video is decoded frame by "
+             "frame, predictions are displayed without ground-truth labels.",
     )
 
     # Optional
@@ -532,6 +551,241 @@ def inferSequence(
 
 
 # =========================================================================
+# Video file helpers
+# =========================================================================
+def loadVideoFrames(videoPath: str) -> List[np.ndarray]:
+    """
+    Decode *all* frames from a video file into a list of BGR numpy arrays.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the video file does not exist.
+    RuntimeError
+        If OpenCV cannot open the video.
+    """
+    p = Path(videoPath)
+    print(f"[Video] Loading video from {p} …")
+    if not p.exists():
+        raise FileNotFoundError(f"Video file not found: {videoPath}")
+
+    cap = cv2.VideoCapture(str(p))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video file: {videoPath}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    totalFrames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[Video] Opened {p.name}  –  {totalFrames} frames, "
+          f"{fps:.1f} FPS")
+
+    frames: List[np.ndarray] = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(frame)
+
+    cap.release()
+    print(f"[Video] Decoded {len(frames)} frames")
+    return frames
+
+
+@torch.no_grad()
+def inferVideoFrames(
+    model: torch.nn.Module,
+    bgrFrames: List[np.ndarray],
+    transform: Any,
+    device: torch.device,
+    confidence: float = 0.5,
+    nmsThreshold: float = 0.5,
+) -> List[Dict[str, Any]]:
+    """
+    Run sliding-window inference on a list of raw BGR frames.
+
+    This mirrors :func:`inferSequence` but operates directly on an
+    in-memory list of frames instead of loading them from *testDir*.
+
+    Returns a list of result dicts (one per frame), each containing:
+        - ``boxes``      : (K, 4) absolute xyxy
+        - ``scores``     : (K,)
+        - ``labels``     : (K,)
+        - ``embeddings`` : (K, D) tracking embeddings
+    """
+    numFrames = model.numFrames
+    queriesPerFrame = model.queriesPerFrame
+    numClasses = model.numClasses
+    totalFrames = len(bgrFrames)
+
+    # Pre-process all frames
+    imgTensors: List[torch.Tensor] = []
+    origSizes: List[Tuple[int, int]] = []
+
+    for bgr in bgrFrames:
+        h, w = bgr.shape[:2]
+        origSizes.append((h, w))
+        tensor, _tgt = preprocessFrame(bgr, transform)
+        imgTensors.append(tensor)
+
+    # ---- Sliding-window inference ----
+    perFrameRaw: List[List[Tuple[torch.Tensor, ...]]] = [
+        [] for _ in range(totalFrames)
+    ]
+
+    stride = max(1, numFrames // 2)
+    windowStarts = list(range(0, max(1, totalFrames - numFrames + 1), stride))
+    if windowStarts[-1] + numFrames < totalFrames:
+        windowStarts.append(totalFrames - numFrames)
+
+    for wStart in windowStarts:
+        wEnd = min(wStart + numFrames, totalFrames)
+        clipLen = wEnd - wStart
+
+        clipTensors = [imgTensors[i] for i in range(wStart, wEnd)]
+        while len(clipTensors) < numFrames:
+            clipTensors.append(clipTensors[-1])
+
+        samples = [
+            nested_tensor_from_tensor_list([t]).to(device)
+            for t in clipTensors
+        ]
+
+        outputs = model(samples)
+
+        predLogits = outputs["pred_logits"]
+        predBoxes = outputs["pred_boxes"]
+        predTracking = outputs["pred_tracking"]
+
+        for localF in range(clipLen):
+            globalF = wStart + localF
+            qStart = localF * queriesPerFrame
+            qEnd = qStart + queriesPerFrame
+
+            logits = predLogits[0, qStart:qEnd]
+            boxesCxcywh = predBoxes[0, qStart:qEnd]
+            embeddings = predTracking[0, qStart:qEnd]
+
+            probs = logits.softmax(-1)[:, :-1]
+            maxScores, maxLabels = probs.max(-1)
+
+            imgH, imgW = origSizes[globalF]
+            cx = boxesCxcywh[:, 0] * imgW
+            cy = boxesCxcywh[:, 1] * imgH
+            bw = boxesCxcywh[:, 2] * imgW
+            bh = boxesCxcywh[:, 3] * imgH
+            x1 = cx - bw / 2
+            y1 = cy - bh / 2
+            x2 = cx + bw / 2
+            y2 = cy + bh / 2
+            absBoxes = torch.stack([x1, y1, x2, y2], dim=-1)
+
+            perFrameRaw[globalF].append(
+                (absBoxes, maxScores, maxLabels, embeddings)
+            )
+
+    # ---- Merge windows & apply NMS per frame ----
+    results: List[Dict[str, Any]] = []
+
+    for fIdx in range(totalFrames):
+        chunks = perFrameRaw[fIdx]
+        if not chunks:
+            results.append({
+                "boxes": np.zeros((0, 4), dtype=np.float32),
+                "scores": np.zeros((0,), dtype=np.float32),
+                "labels": np.zeros((0,), dtype=np.int64),
+                "embeddings": np.zeros((0, 0), dtype=np.float32),
+            })
+            continue
+
+        allBoxes = torch.cat([c[0] for c in chunks], dim=0)
+        allScores = torch.cat([c[1] for c in chunks], dim=0)
+        allLabels = torch.cat([c[2] for c in chunks], dim=0)
+        allEmbed = torch.cat([c[3] for c in chunks], dim=0)
+
+        keep = allScores >= confidence
+        allBoxes = allBoxes[keep]
+        allScores = allScores[keep]
+        allLabels = allLabels[keep]
+        allEmbed = allEmbed[keep]
+
+        if len(allScores) > 0:
+            keepNms = nmsPerFrame(allBoxes, allScores, allLabels, nmsThreshold)
+            allBoxes = allBoxes[keepNms]
+            allScores = allScores[keepNms]
+            allLabels = allLabels[keepNms]
+            allEmbed = allEmbed[keepNms]
+
+        results.append({
+            "boxes": allBoxes.cpu().numpy(),
+            "scores": allScores.cpu().numpy(),
+            "labels": allLabels.cpu().numpy(),
+            "embeddings": allEmbed.cpu().numpy(),
+        })
+
+    return results
+
+
+# =========================================================================
+# Video-mode drawing helper (predictions only – no GT)
+# =========================================================================
+def drawVideoFrame(
+    bgrImage: np.ndarray,
+    predResult: Dict[str, Any],
+    classNames: List[str],
+    palette: List[Tuple[int, int, int]],
+    videoName: str,
+    framePos: int,
+    totalFrames: int,
+) -> np.ndarray:
+    """
+    Draw prediction boxes on a copy of *bgrImage* (no ground-truth).
+
+    Returns the annotated image.
+    """
+    vis = bgrImage.copy()
+    imgH, imgW = vis.shape[:2]
+
+    boxes = predResult["boxes"]
+    scores = predResult["scores"]
+    labels = predResult["labels"]
+    trackIds = predResult.get("trackId", np.full(len(scores), -1))
+
+    for i in range(len(boxes)):
+        x1, y1, x2, y2 = boxes[i].astype(int)
+        cls = int(labels[i]) % len(palette)
+        colour = palette[cls]
+        cv2.rectangle(vis, (x1, y1), (x2, y2), colour, 3, cv2.LINE_AA)
+
+        clsName = classNames[cls] if cls < len(classNames) else str(cls)
+        tid = int(trackIds[i])
+        label = f"{clsName} {scores[i]:.2f} t{tid}"
+        (tw, th), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1
+        )
+        cv2.rectangle(
+            vis, (x1, y2), (x1 + tw + 4, y2 + th + 6), colour, -1
+        )
+        cv2.putText(
+            vis, label, (x1 + 2, y2 + th + 3),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+
+    # --- HUD ---
+    hud = (f"{videoName}  |  Frame {framePos + 1}/{totalFrames}  |  "
+           f"Preds: {len(boxes)}")
+    cv2.putText(
+        vis, hud, (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA,
+    )
+    helpText = "[Space/d]->  [a]<-  [q]uit"
+    cv2.putText(
+        vis, helpText, (10, imgH - 12),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA,
+    )
+
+    return vis
+
+
+# =========================================================================
 # Cross-frame track association using tracking embeddings
 # =========================================================================
 def associateTracks(
@@ -765,13 +1019,6 @@ def main():
         classNames = [str(i) for i in range(numClasses)]
     palette = _buildColourPalette(max(numClasses, len(classNames)))
 
-    # ---- Discover sequences ----
-    sequences = discoverTestSequences(args.testDir)
-    if not sequences:
-        print("[Inference] No sequences found – exiting.")
-        return
-    seqIds = sorted(sequences.keys())
-
     # ---- Transforms (same as val) ----
     transform = makeInferenceTransform(maxSize=args.maxSize)
 
@@ -780,6 +1027,90 @@ def main():
     if saveDir:
         saveDir.mkdir(parents=True, exist_ok=True)
         print(f"[Inference] Saving annotated frames to {saveDir}")
+
+    # ==================================================================
+    # VIDEO MODE  –  --videoPath has higher priority than --testDir
+    # ==================================================================
+    if args.videoPath:
+        videoPath = Path(args.videoPath)
+        videoName = videoPath.stem
+
+        # Load all frames from the video file
+        bgrFrames = loadVideoFrames(str(videoPath))
+        if not bgrFrames:
+            print("[Inference] No frames decoded from video – exiting.")
+            return
+
+        totalFrames = len(bgrFrames)
+        print(f"\n{'='*60}")
+        print(f"[Inference] Video: {videoPath.name}  ({totalFrames} frames)")
+        print(f"{'='*60}")
+
+        # Run inference on all frames
+        results = inferVideoFrames(
+            model,
+            bgrFrames,
+            transform,
+            device,
+            confidence=args.confidence,
+            nmsThreshold=args.nmsThreshold,
+        )
+
+        # Associate tracks across frames
+        results = associateTracks(results, args.trackingThreshold)
+
+        # --- Display / save ---
+        fPos = 0
+        while 0 <= fPos < totalFrames:
+            vis = drawVideoFrame(
+                bgrFrames[fPos], results[fPos],
+                classNames, palette,
+                videoName, fPos, totalFrames,
+            )
+
+            if saveDir:
+                outPath = saveDir / f"{videoName}_frame_{fPos:06d}.jpg"
+                cv2.imwrite(str(outPath), vis)
+                fPos += 1
+                continue
+
+            cv2.imshow(args.windowName, vis)
+            key = cv2.waitKey(0) & 0xFF
+
+            if key in (ord("q"), 27):  # q / ESC
+                cv2.destroyAllWindows()
+                print("[Inference] Quit.")
+                return
+            elif key in (ord("d"), ord(" "), 83):  # d / space / right arrow
+                fPos += 1
+            elif key in (ord("a"), 81):  # a / left arrow
+                fPos = max(0, fPos - 1)
+            elif key == ord("s"):  # save current frame (debug)
+                debugPath = Path(
+                    f"stored_frames/debug_{videoName}_frame{fPos:06d}.jpg"
+                )
+                os.makedirs(debugPath.parent, exist_ok=True)
+                cv2.imwrite(str(debugPath), vis)
+                print(f"  Saved debug image to {debugPath}")
+                fPos += 1
+            else:
+                fPos += 1  # default: advance
+
+        if saveDir:
+            print(f"  Saved {totalFrames} annotated frames for {videoName}")
+
+        cv2.destroyAllWindows()
+        print("\n[Inference] Video processing complete.")
+        return
+
+    # ==================================================================
+    # TEST-DIR MODE  –  original sequence-based path
+    # ==================================================================
+    sequences = discoverTestSequences(args.testDir)
+    if not sequences:
+        print("[Inference] No sequences found – exiting.")
+        return
+    seqIds = sorted(sequences.keys())
 
     # ---- Interactive visualisation loop ----
     seqIdx = args.index
