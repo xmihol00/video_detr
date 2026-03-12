@@ -16,9 +16,9 @@ experiment-*
 not_tracked_dir/
 .vscode
 vidDetr/test
-test/
 tao_dataset_evaluation
 gt_vs_pred/
 debug_frames
 picked_images
 stored_frames/
+testData/
