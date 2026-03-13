@@ -10,6 +10,7 @@ Use the `.venv` Python virtual environment for development. To activate it, run:
 
 ## Hardware Stack
 The system is designed to run on a local development machines with a small or no GPU and then on a GPU server where each node can have up to 8 GPUs. The scripts must be executable on all architectures.
+Eventually, the goal is to distribute the architecture onto edge devices. The CNN backbone will run on an IMX500 Sony accelerator, and the transformer with the heads on a Hailo-8 or Hailo-10 accelerator. The code should be structured in a way that allows for this distribution in the future, but for now, all code will run on the same machine for simplicity.
 
 ## Software Stack
 Mainly Python with common libraries for DNN training and general work with AI and ML.
@@ -18,7 +19,7 @@ If library is a good fit for a particular purpose, install it using `pip install
 
 ## Repository structure
 ```
-cnnSearch			       # TBD: python scripts that will implement the search of the best CNN architecture using genetic algorithms
+cnnSearch			       # TBD: python scripts that will implement the search of the best CNN architecture for the Sony IMX500 using genetic algorithms
 vidDetr
 ├── datasets
 │   ├── __init__.py                    # Re-exports all three dataset classes and their collate functions
@@ -78,10 +79,15 @@ vidDetr
 6. Update the `BACKLOG.md` file.
 7. Be thorough, analuze ecisting code deeply, thing about the changes critically.
 8. Do not write defensive code, this is not an app that would be published somewhere and tested for edge cases.
-7. Suggest a commit message that clearly describes the change if the change is significant enough to warrant a commit. For smaller changes, you can skip this step. Do not commit by yourself.
+9. If a new significant feature was added, or a significant change was made, update also the `README.md` file to keep it up to date.
+10. Suggest a commit message that clearly describes the change if the change is significant enough to warrant a commit. For smaller changes, you can skip this step. Do not commit by yourself.
 
 ## Testing
 Implement unit tests using `pytest`. Tests should be organized by module and functionality. Use mocks to simulate hardware interactions and TCP communication. The testing does not have to be exhaustive, since the code will have to be tested on physical hardware eventually, but it should cover critical logic paths and edge cases.
 - All tests live under `tests/`.
 - Tests should not on training data, use some dummy values.
 
+## Notes for AI Agents
+- Write TODO lists to avoid forgetting important steps in the implementation.
+- Expect the tasks to be more complex than they seem at first glance, and plan accordingly. Analyze the existing code deeply to understand how it works and how your changes will fit in. Always assume the maxum difficulty of the task and plan for it accordingly, rather than assuming it will be easy. 
+- Think critically about the changes you are making and how they will affect the overall architecture.
