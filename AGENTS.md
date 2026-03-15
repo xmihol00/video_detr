@@ -80,7 +80,8 @@ vidDetr
 7. Be thorough, analuze ecisting code deeply, thing about the changes critically.
 8. Do not write defensive code, this is not an app that would be published somewhere and tested for edge cases.
 9. If a new significant feature was added, or a significant change was made, update also the `README.md` file to keep it up to date.
-10. Suggest a commit message that clearly describes the change if the change is significant enough to warrant a commit. For smaller changes, you can skip this step. Do not commit by yourself.
+10. Keep the cnnSearch/models/SUPERNET.md file up to date with the current architecture of the supernet in the cnnSearch/models/supernet.py.
+11. Suggest a commit message that clearly describes the change if the change is significant enough to warrant a commit. For smaller changes, you can skip this step. Do not commit by yourself.
 
 ## Testing
 Implement unit tests using `pytest`. Tests should be organized by module and functionality. Use mocks to simulate hardware interactions and TCP communication. The testing does not have to be exhaustive, since the code will have to be tested on physical hardware eventually, but it should cover critical logic paths and edge cases.

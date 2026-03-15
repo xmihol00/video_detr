@@ -19,7 +19,7 @@ from cnnSearch.trainer import TrainConfig, appendJsonLog, evaluate, saveCheckpoi
 def parseArguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Train ResNet SuperNet for NAS")
 
-    parser.add_argument("--trainDir", type=str, required=True, help="Path to ImageFolder training root")
+    parser.add_argument("--trainDir", type=str, default="/mnt/matylda5/xmihol00/datasets/imagenet/train", help="Path to ImageFolder training root")
     parser.add_argument("--valDir", type=str, default=None, help="Optional ImageFolder validation root")
 
     parser.add_argument("--epochs", type=int, default=90)
@@ -36,7 +36,7 @@ def parseArguments() -> argparse.Namespace:
 
     parser.add_argument("--saveDir", type=str, default="cnnSearch/outputs/supernet")
     parser.add_argument("--evalEveryEpochs", type=int, default=1)
-    parser.add_argument("--valSplitRatio", type=float, default=0.1)
+    parser.add_argument("--valSplitRatio", type=float, default=0.15)
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None)
