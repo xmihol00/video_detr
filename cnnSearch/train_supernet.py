@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import sys
+import time
+
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import torch
 from torch.cuda.amp import GradScaler
@@ -9,9 +16,24 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from cnnSearch.data import buildImageFolderLoaders
 from cnnSearch.distributed import cleanupDistributed, getRank, isMainProcess, setupDistributed
+from cnnSearch.logging_utils import LoggingConfig, configureLogging, getEventLogger
 from cnnSearch.models.supernet import ResNetSuperNet
 from cnnSearch.search_space import ArchitectureConfig, DEFAULT_SEARCH_SPACE
 from cnnSearch.trainer import TrainConfig, appendJsonLog, evaluate, saveCheckpoint, trainOneEpoch
+
+NUM_GPUS = 1
+
+import safe_gpu
+while True:
+    try:
+        safe_gpu.claim_gpus(NUM_GPUS)
+        break
+    except:
+        print("Waiting for free GPU")
+        time.sleep(5)
+        pass
+
+LOGGER = getEventLogger(__name__)
 
 def parseArguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Train ResNet SuperNet for NAS")
@@ -20,9 +42,9 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--valDir", type=str, default=None, help="Optional ImageFolder validation root")
 
     parser.add_argument("--epochs", type=int, default=90)
-    parser.add_argument("--batchSize", type=int, default=128)
+    parser.add_argument("--batchSize", type=int, default=24)
     parser.add_argument("--numWorkers", type=int, default=8)
-    parser.add_argument("--imageSize", type=int, default=224)
+    parser.add_argument("--imageSize", type=int, default=320)
 
     parser.add_argument("--learningRate", type=float, default=0.1)
     parser.add_argument("--weightDecay", type=float, default=1e-4)
@@ -39,6 +61,10 @@ def parseArguments() -> argparse.Namespace:
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--logLevel", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    parser.add_argument("--logFormat", type=str, default="text", choices=["text", "json"])
+    parser.add_argument("--logFile", type=str, default=None)
+    parser.add_argument("--logIntervalSteps", type=int, default=50)
 
     return parser.parse_args()
 
@@ -66,11 +92,35 @@ def _setSeeds(seed: int, rank: int) -> None:
 
 def main() -> None:
     args = parseArguments()
+
+    configureLogging(
+        LoggingConfig(
+            logLevel=args.logLevel,
+            logFormat=args.logFormat,
+            logFilePath=args.logFile,
+            enableConsole=True,
+        )
+    )
+
+    LOGGER.info(
+        "Starting supernet training entrypoint",
+        trainDir=args.trainDir,
+        valDir=args.valDir,
+        epochs=args.epochs,
+        batchSize=args.batchSize,
+        imageSize=args.imageSize,
+        amp=args.amp,
+        logLevel=args.logLevel,
+        logFormat=args.logFormat,
+        logFile=args.logFile,
+    )
+
     Path(args.saveDir).mkdir(parents=True, exist_ok=True)
 
     isDistributed, device, localRank = setupDistributed()
     rank = getRank()
     _setSeeds(args.seed, rank)
+    LOGGER.info("Initialized runtime and seeds", rank=rank, localRank=localRank, distributed=isDistributed, device=str(device), seed=args.seed)
 
     dataBundle = buildImageFolderLoaders(
         trainDir=args.trainDir,
@@ -81,6 +131,13 @@ def main() -> None:
         distributed=isDistributed,
         valSplitRatio=args.valSplitRatio,
         splitSeed=args.seed,
+        eventLogger=LOGGER,
+    )
+    LOGGER.info(
+        "Constructed dataloaders",
+        trainBatches=len(dataBundle.trainLoader),
+        valBatches=len(dataBundle.valLoader),
+        numClasses=dataBundle.numClasses,
     )
 
     searchSpace = DEFAULT_SEARCH_SPACE
@@ -109,6 +166,7 @@ def main() -> None:
 
     if isDistributed:
         model = DDP(model, device_ids=[localRank] if device.type == "cuda" else None)
+    LOGGER.info("Model instantiated", distributedWrapped=isDistributed)
 
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -123,12 +181,14 @@ def main() -> None:
     bestTop1 = 0.0
 
     if args.resume:
+        LOGGER.info("Loading checkpoint for resume", checkpointPath=args.resume)
         checkpoint = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scaler.load_state_dict(checkpoint["scaler"])
         startEpoch = int(checkpoint["epoch"]) + 1
         bestTop1 = float(checkpoint.get("bestMetric", 0.0))
+        LOGGER.info("Checkpoint loaded", startEpoch=startEpoch, bestTop1=bestTop1)
 
     trainConfig = TrainConfig(
         epochs=args.epochs,
@@ -144,6 +204,7 @@ def main() -> None:
     evalArchitecture = _buildEvaluationArchitecture(args.imageSize)
 
     for epochIndex in range(startEpoch, trainConfig.epochs):
+        LOGGER.info("Epoch started", epoch=epochIndex)
         if dataBundle.trainSampler is not None:
             dataBundle.trainSampler.set_epoch(epochIndex)
 
@@ -158,6 +219,8 @@ def main() -> None:
             gradientClipNorm=trainConfig.gradientClipNorm,
             auxiliaryLossWeight=trainConfig.auxiliaryLossWeight,
             referenceResolution=args.imageSize,
+            eventLogger=LOGGER,
+            logIntervalSteps=args.logIntervalSteps,
         )
 
         scheduler.step()
@@ -177,6 +240,8 @@ def main() -> None:
                 device=device,
                 architectureConfig=evalArchitecture,
                 ampEnabled=trainConfig.ampEnabled,
+                eventLogger=LOGGER,
+                logIntervalSteps=max(1, args.logIntervalSteps * 2),
             )
             metricsForLog.update(
                 {
@@ -195,6 +260,7 @@ def main() -> None:
                         bestPath,
                         _use_new_zipfile_serialization=False,
                     )
+                    LOGGER.info("Saved new best model", epoch=epochIndex, bestTop1=bestTop1, bestPath=str(bestPath))
 
         if isMainProcess():
             appendJsonLog(trainConfig.saveDir, metricsForLog)
@@ -209,7 +275,18 @@ def main() -> None:
                     extraState={"rank": rank},
                 )
 
+        LOGGER.info(
+            "Epoch completed",
+            epoch=epochIndex,
+            trainLoss=trainMetrics["loss"],
+            trainTop1=trainMetrics["top1"],
+            trainTop5=trainMetrics["top5"],
+            learningRate=scheduler.get_last_lr()[0],
+            bestTop1=bestTop1,
+        )
+
     cleanupDistributed()
+    LOGGER.info("Training run completed", bestTop1=bestTop1)
 
 
 if __name__ == "__main__":

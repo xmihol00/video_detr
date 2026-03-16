@@ -56,7 +56,7 @@ class ArchitectureConfig:
 
 
 DEFAULT_SEARCH_SPACE = SearchSpaceConfig(
-    inputResolutions=[128, 160, 192, 224],
+    inputResolutions=[192, 224, 256, 288, 320],
     outputStrides=[8, 16, 32],
     depthOptionsPerStage=[
         [1, 2, 3],

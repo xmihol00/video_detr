@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Dict, List, Optional, Tuple, cast
 import json
 import random
@@ -11,8 +12,23 @@ from torch import Tensor, nn
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
 
+from cnnSearch.logging_utils import EventLogger, getEventLogger
 from cnnSearch.metrics import computeTopKAccuracy, reduceTensorAverage
 from cnnSearch.search_space import ArchitectureConfig, DEFAULT_SEARCH_SPACE, sampleRandomArchitecture
+
+NUM_GPUS = 1
+
+import safe_gpu
+while True:
+    try:
+        safe_gpu.claim_gpus(NUM_GPUS)
+        break
+    except:
+        print("Waiting for free GPU")
+        time.sleep(5)
+        pass
+
+LOGGER = getEventLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -64,6 +80,20 @@ def _sampleBatchArchitecture(referenceResolution: int) -> ArchitectureConfig:
     )
 
 
+def _getGpuMemoryStatsMb(device: torch.device) -> Optional[Dict[str, float]]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+
+    allocatedMb = float(torch.cuda.memory_allocated(device) / (1024.0 * 1024.0))
+    reservedMb = float(torch.cuda.memory_reserved(device) / (1024.0 * 1024.0))
+    peakAllocatedMb = float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
+    return {
+        "allocatedMb": allocatedMb,
+        "reservedMb": reservedMb,
+        "peakAllocatedMb": peakAllocatedMb,
+    }
+
+
 def trainOneEpoch(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -75,8 +105,23 @@ def trainOneEpoch(
     gradientClipNorm: float,
     auxiliaryLossWeight: float,
     referenceResolution: int,
+    eventLogger: Optional[EventLogger] = None,
+    logIntervalSteps: int = 5,
 ) -> Dict[str, float]:
     model.train()
+    activeLogger = eventLogger if eventLogger is not None else LOGGER
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+    activeLogger.info(
+        "Starting train epoch",
+        epoch=epochIndex,
+        ampEnabled=ampEnabled,
+        gradientClipNorm=gradientClipNorm,
+        auxiliaryLossWeight=auxiliaryLossWeight,
+        referenceResolution=referenceResolution,
+    )
 
     runningLoss = 0.0
     runningTop1 = 0.0
@@ -124,17 +169,77 @@ def trainOneEpoch(
         runningTop5 += float(top5Tensor.item())
         numSteps += 1
 
+        gpuMemoryStats = _getGpuMemoryStatsMb(device)
+        if gpuMemoryStats is None:
+            memoryMessage = "gpuMem=cpu"
+            gpuAllocatedMb = 0.0
+            gpuReservedMb = 0.0
+            gpuPeakAllocatedMb = 0.0
+        else:
+            gpuAllocatedMb = gpuMemoryStats["allocatedMb"]
+            gpuReservedMb = gpuMemoryStats["reservedMb"]
+            gpuPeakAllocatedMb = gpuMemoryStats["peakAllocatedMb"]
+            memoryMessage = (
+                f"gpuMemAlloc={gpuAllocatedMb:.1f}MB "
+                f"gpuMemRes={gpuReservedMb:.1f}MB "
+                f"gpuMemPeak={gpuPeakAllocatedMb:.1f}MB"
+            )
+
+        activeLogger.logEveryN(
+            key=f"train.epoch.{epochIndex}.metrics",
+            everyN=max(1, logIntervalSteps),
+            message=(
+                f"Training batch metrics | "
+                f"loss={float(loss.item()):.4f} "
+                f"top1={float(top1Tensor.item()):.2f} "
+                f"top5={float(top5Tensor.item()):.2f} "
+                f"{memoryMessage}"
+            ),
+            epoch=epochIndex,
+            step=numSteps,
+            batchLoss=float(loss.item()),
+            batchTop1=float(top1Tensor.item()),
+            batchTop5=float(top5Tensor.item()),
+            gpuMemAllocMb=gpuAllocatedMb,
+            gpuMemReservedMb=gpuReservedMb,
+            gpuMemPeakMb=gpuPeakAllocatedMb,
+        )
+
     metricTensor = torch.tensor(
         [runningLoss / max(1, numSteps), runningTop1 / max(1, numSteps), runningTop5 / max(1, numSteps)],
         device=device,
     )
     metricTensor = reduceTensorAverage(metricTensor)
 
-    return {
+    epochMetrics = {
         "loss": float(metricTensor[0].item()),
         "top1": float(metricTensor[1].item()),
         "top5": float(metricTensor[2].item()),
     }
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        epochPeakGpuMb = float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
+        epochMemoryMessage = f"gpuMemPeak={epochPeakGpuMb:.1f}MB"
+    else:
+        epochPeakGpuMb = 0.0
+        epochMemoryMessage = "gpuMem=cpu"
+
+    activeLogger.info(
+        (
+            f"Completed train epoch | "
+            f"loss={epochMetrics['loss']:.4f} "
+            f"top1={epochMetrics['top1']:.2f} "
+            f"top5={epochMetrics['top5']:.2f} "
+            f"{epochMemoryMessage}"
+        ),
+        epoch=epochIndex,
+        epochLoss=epochMetrics["loss"],
+        epochTop1=epochMetrics["top1"],
+        epochTop5=epochMetrics["top5"],
+        epochGpuPeakMb=epochPeakGpuMb,
+        steps=numSteps,
+    )
+    return epochMetrics
 
 
 def evaluate(
@@ -143,8 +248,18 @@ def evaluate(
     device: torch.device,
     architectureConfig: ArchitectureConfig,
     ampEnabled: bool,
+    eventLogger: Optional[EventLogger] = None,
+    logIntervalSteps: int = 100,
 ) -> EvalResult:
     model.eval()
+    activeLogger = eventLogger if eventLogger is not None else LOGGER
+
+    activeLogger.info(
+        "Starting evaluation",
+        outputStride=architectureConfig.outputStride,
+        inputResolution=architectureConfig.inputResolution,
+        ampEnabled=ampEnabled,
+    )
 
     runningLoss = 0.0
     runningTop1 = 0.0
@@ -175,17 +290,35 @@ def evaluate(
             runningTop5 += float(top5Tensor.item())
             numSteps += 1
 
+            activeLogger.logEveryN(
+                key="evaluate.batch.progress",
+                everyN=max(1, logIntervalSteps),
+                message="Evaluation batch progress",
+                step=numSteps,
+                batchLoss=float(loss.item()),
+                batchTop1=float(top1Tensor.item()),
+                batchTop5=float(top5Tensor.item()),
+            )
+
     metricTensor = torch.tensor(
         [runningLoss / max(1, numSteps), runningTop1 / max(1, numSteps), runningTop5 / max(1, numSteps)],
         device=device,
     )
     metricTensor = reduceTensorAverage(metricTensor)
 
-    return EvalResult(
+    result = EvalResult(
         loss=float(metricTensor[0].item()),
         top1=float(metricTensor[1].item()),
         top5=float(metricTensor[2].item()),
     )
+    activeLogger.info(
+        "Completed evaluation",
+        loss=result.loss,
+        top1=result.top1,
+        top5=result.top5,
+        steps=numSteps,
+    )
+    return result
 
 
 def saveCheckpoint(
@@ -213,6 +346,12 @@ def saveCheckpoint(
         state["extraState"] = extraState
 
     torch.save(state, checkpointPath, _use_new_zipfile_serialization=False)
+    LOGGER.info(
+        "Saved checkpoint",
+        checkpointPath=str(checkpointPath),
+        epoch=epochIndex,
+        bestMetric=bestMetric,
+    )
     return str(checkpointPath)
 
 
@@ -221,3 +360,9 @@ def appendJsonLog(saveDir: str, metrics: Dict[str, object]) -> None:
     logPath = Path(saveDir) / "training_log.jsonl"
     with logPath.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(metrics) + "\n")
+    LOGGER.logEveryN(
+        key="trainer.jsonl.append",
+        everyN=10,
+        message="Appended training metrics to JSONL",
+        logPath=str(logPath),
+    )

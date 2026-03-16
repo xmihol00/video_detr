@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
+
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import torch
 from torch.cuda.amp import autocast
@@ -9,10 +15,14 @@ import torch.nn.functional as F
 
 from cnnSearch.architecture_io import loadArchitectureConfig
 from cnnSearch.data import buildImageFolderLoaders
+from cnnSearch.logging_utils import LoggingConfig, configureLogging, getEventLogger
 from cnnSearch.models.subnet import extractSubnetFromSupernet
 from cnnSearch.models.supernet import ResNetSuperNet
 from cnnSearch.profiling import collectModelResourceMetrics
 from cnnSearch.search_space import DEFAULT_SEARCH_SPACE
+
+
+LOGGER = getEventLogger(__name__)
 
 
 def parseArguments() -> argparse.Namespace:
@@ -24,6 +34,9 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--numWorkers", type=int, default=8)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--outputJson", type=str, default=None)
+    parser.add_argument("--logLevel", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    parser.add_argument("--logFormat", type=str, default="text", choices=["text", "json"])
+    parser.add_argument("--logFile", type=str, default=None)
     return parser.parse_args()
 
 
@@ -34,6 +47,7 @@ def evaluateTopK(
     ampEnabled: bool,
 ) -> dict:
     model.eval()
+    LOGGER.info("Starting candidate top-k evaluation", ampEnabled=ampEnabled, device=str(device))
 
     runningLoss = 0.0
     runningTop1 = 0.0
@@ -59,17 +73,45 @@ def evaluateTopK(
             runningTop5 += float(correctTop5.item())
             steps += 1
 
-    return {
+            LOGGER.logEveryN(
+                key="candidate.evaluate.batch",
+                everyN=50,
+                message="Candidate evaluation batch progress",
+                step=steps,
+                batchLoss=float(loss.item()),
+                batchTop1=float(correctTop1.item()),
+                batchTop5=float(correctTop5.item()),
+            )
+
+    result = {
         "loss": runningLoss / max(steps, 1),
         "top1": runningTop1 / max(steps, 1),
         "top5": runningTop5 / max(steps, 1),
     }
+    LOGGER.info("Completed candidate top-k evaluation", steps=steps, loss=result["loss"], top1=result["top1"], top5=result["top5"])
+    return result
 
 
 def main() -> None:
     args = parseArguments()
 
+    configureLogging(
+        LoggingConfig(
+            logLevel=args.logLevel,
+            logFormat=args.logFormat,
+            logFilePath=args.logFile,
+            enableConsole=True,
+        )
+    )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    LOGGER.info(
+        "Starting candidate evaluation",
+        checkpoint=args.supernetCheckpoint,
+        architectureJson=args.architectureJson,
+        valDir=args.valDir,
+        device=str(device),
+    )
 
     architectureConfig = loadArchitectureConfig(args.architectureJson)
 
@@ -80,6 +122,7 @@ def main() -> None:
         batchSize=args.batchSize,
         numWorkers=args.numWorkers,
         distributed=False,
+        eventLogger=LOGGER,
     )
 
     searchSpace = type(DEFAULT_SEARCH_SPACE)(
@@ -104,6 +147,7 @@ def main() -> None:
     )
 
     supernet = ResNetSuperNet(searchSpace=searchSpace)
+    LOGGER.info("Loading supernet checkpoint")
     checkpoint = torch.load(args.supernetCheckpoint, map_location="cpu")
     if "model" in checkpoint:
         modelState = checkpoint["model"]
@@ -114,6 +158,7 @@ def main() -> None:
         modelState = {key.replace("module.", "", 1): value for key, value in modelState.items()}
 
     supernet.load_state_dict(modelState)
+    LOGGER.info("Supernet checkpoint loaded", stateKeys=len(modelState))
 
     extracted = extractSubnetFromSupernet(supernet, architectureConfig=architectureConfig, searchSpace=searchSpace)
     subnet = extracted.model.to(device)
@@ -130,6 +175,11 @@ def main() -> None:
         inputResolution=architectureConfig.inputResolution,
         device=device,
     )
+    LOGGER.info(
+        "Collected resource metrics",
+        latencyMs=resourceMetrics["latencyMs"],
+        parameterMemoryMb=resourceMetrics["parameterMemoryMb"],
+    )
 
     result = {
         "architecture": architectureConfig.toDict(),
@@ -141,6 +191,7 @@ def main() -> None:
     if args.outputJson is not None:
         with open(args.outputJson, "w", encoding="utf-8") as handle:
             json.dump(result, handle, indent=2)
+        LOGGER.info("Saved evaluation JSON", outputJson=args.outputJson)
 
 
 if __name__ == "__main__":

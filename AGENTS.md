@@ -80,7 +80,7 @@ vidDetr
 4. Write unit tests for your changes and run all tests to ensure nothing is broken.
 5. Summarize the updates into a concise description and add it to the `PROGRESS.md` file with the date of the change.
 6. Update the `BACKLOG.md` file.
-7. Be thorough, analuze ecisting code deeply, thing about the changes critically.
+7. Be thorough, analyze existing code deeply, thing about the changes critically.
 8. Do not write defensive code, this is not an app that would be published somewhere and tested for edge cases.
 9. If a new significant feature was added, or a significant change was made, update also the `README.md` file to keep it up to date.
 10. Keep the cnnSearch/models/SUPERNET.md file up to date with the current architecture of the supernet in the cnnSearch/models/supernet.py.

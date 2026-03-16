@@ -24,6 +24,10 @@ ResNet-family supernet training stack for neural architecture search targeting e
   - top-1 / top-5 accuracy,
   - parameter memory footprint,
   - latency measurement.
+- Configurable training/evaluation logging with:
+  - text or JSON output,
+  - optional log file sink,
+  - deduplicated and throttled event logging for iterative loops.
 
 ## Dataset format
 
@@ -50,6 +54,8 @@ cd /home/david/projs/video_detr
   --numWorkers 8 \
   --imageSize 224 \
   --auxiliaryLossWeight 0.3 \
+  --logLevel INFO \
+  --logFormat text \
   --amp \
   --saveDir cnnSearch/outputs/supernet_run_01
 ```
@@ -66,6 +72,9 @@ torchrun --nproc_per_node=4 -m cnnSearch.train_supernet \
   --numWorkers 8 \
   --imageSize 224 \
   --auxiliaryLossWeight 0.3 \
+  --logLevel INFO \
+  --logFormat json \
+  --logFile cnnSearch/outputs/supernet_ddp_run_01/train.jsonl \
   --amp \
   --saveDir cnnSearch/outputs/supernet_ddp_run_01
 ```
@@ -102,8 +111,26 @@ cd /home/david/projs/video_detr
   --valDir /path/to/imagenet_val \
   --batchSize 128 \
   --numWorkers 8 \
+  --logLevel INFO \
+  --logFormat text \
   --amp \
   --outputJson cnnSearch/outputs/candidate_eval.json
+
+## Logging configuration
+
+Both `train_supernet.py` and `evaluate_candidate.py` support runtime logging configuration:
+
+- `--logLevel`: `DEBUG|INFO|WARNING|ERROR|CRITICAL`
+- `--logFormat`: `text|json`
+- `--logFile`: optional path for persistent logs
+
+The logger implementation (`cnnSearch/logging_utils.py`) uses event-aware helpers to avoid repetitive spam:
+
+- `logOnce(key, ...)`: emit only one time for a key.
+- `logEveryN(key, n, ...)`: emit every `n`-th event in loops.
+- `logInterval(key, seconds, ...)`: emit at most once per interval.
+
+This enables deeper observability for data loading and training dynamics while keeping logs compact.
 ```
 
 ## Key modules
