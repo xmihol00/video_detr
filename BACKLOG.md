@@ -2,11 +2,15 @@
 
 ## Current Priorities
 
-1. Implement NSGA-II search loop over `cnnSearch.search_space.ArchitectureConfig`.
-2. Add search experiment runner with multi-seed execution and artifact tracking.
-3. Add Pareto metrics reporting (hypervolume, front spread, convergence curves).
-4. Integrate quantization/compression evaluation hooks into candidate scoring pipeline.
-5. Add latency surrogate calibration workflow against measured device/runtime latency.
-6. Add rank-correlation checks between supernet proxy ranking and standalone subnet retraining.
-7. Add HPC launcher scripts for long-running search experiments.
-8. Add GA-focused unit tests and deterministic replay tests.
+1. Implement NSGA-II search loop over the expanded architecture genome (`path/kernel/extra-stride` included).
+2. Add path-fusion-aware architecture encoding and mutation operators for GA (preferred path indices + kernel + stride constraints).
+3. Add search-space constraints to avoid pathological combinations (e.g., excessive early downsampling).
+4. Add supernet sampling scheduler balancing path/kernel/depth coverage statistics.
+5. Add learned path-fusion gate ablation (equal fixed weights vs learnable weights).
+6. Extend evaluation runner to include auxiliary-head and per-path contribution diagnostics.
+7. Add Pareto metrics reporting (hypervolume, front spread, convergence curves).
+8. Integrate quantization/compression evaluation hooks into candidate scoring pipeline.
+9. Add latency surrogate calibration workflow against measured device/runtime latency.
+10. Add rank-correlation checks between supernet proxy ranking and standalone subnet retraining.
+11. Add HPC launcher scripts for long-running search experiments.
+12. Add GA-focused unit tests and deterministic replay tests.

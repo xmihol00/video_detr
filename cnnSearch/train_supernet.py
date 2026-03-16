@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Optional
 
 import torch
-from torch import nn
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -14,7 +12,6 @@ from cnnSearch.distributed import cleanupDistributed, getRank, isMainProcess, se
 from cnnSearch.models.supernet import ResNetSuperNet
 from cnnSearch.search_space import ArchitectureConfig, DEFAULT_SEARCH_SPACE
 from cnnSearch.trainer import TrainConfig, appendJsonLog, evaluate, saveCheckpoint, trainOneEpoch
-
 
 def parseArguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Train ResNet SuperNet for NAS")
@@ -33,10 +30,12 @@ def parseArguments() -> argparse.Namespace:
 
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision training")
     parser.add_argument("--gradientClipNorm", type=float, default=0.0)
+    parser.add_argument("--auxiliaryLossWeight", type=float, default=0.3)
 
     parser.add_argument("--saveDir", type=str, default="cnnSearch/outputs/supernet")
     parser.add_argument("--evalEveryEpochs", type=int, default=1)
     parser.add_argument("--valSplitRatio", type=float, default=0.15)
+    parser.add_argument("--disableCheckpointing", action="store_true", help="Skip writing checkpoints and best model files")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None)
@@ -51,6 +50,11 @@ def _buildEvaluationArchitecture(imageSize: int) -> ArchitectureConfig:
         stageDepths=[max(options) for options in DEFAULT_SEARCH_SPACE.depthOptionsPerStage],
         stageWidthMultipliers=[max(options) for options in DEFAULT_SEARCH_SPACE.widthMultipliersPerStage],
         stemChannels=max(DEFAULT_SEARCH_SPACE.stemChannels),
+        stemPathIndex=1,
+        stagePathIndices=[1, 1, 1, 1],
+        stageKernelSizes=[3, 3, 3, 3],
+        stageExtraStrides=[1, 1, 1, 1],
+        enableAuxiliaryHeads=False,
     )
 
 
@@ -62,6 +66,7 @@ def _setSeeds(seed: int, rank: int) -> None:
 
 def main() -> None:
     args = parseArguments()
+    Path(args.saveDir).mkdir(parents=True, exist_ok=True)
 
     isDistributed, device, localRank = setupDistributed()
     rank = getRank()
@@ -86,6 +91,17 @@ def main() -> None:
         widthMultipliersPerStage=searchSpace.widthMultipliersPerStage,
         baseChannelsPerStage=searchSpace.baseChannelsPerStage,
         stemChannels=searchSpace.stemChannels,
+        stemPathOptions=searchSpace.stemPathOptions,
+        stagePathOptionsPerStage=searchSpace.stagePathOptionsPerStage,
+        stageKernelSizeOptionsPerStage=searchSpace.stageKernelSizeOptionsPerStage,
+        stageExtraStrideOptionsPerStage=searchSpace.stageExtraStrideOptionsPerStage,
+        pathDepthMultipliers=searchSpace.pathDepthMultipliers,
+        pathWidthMultipliers=searchSpace.pathWidthMultipliers,
+        pathDilations=searchSpace.pathDilations,
+        pathUseSE=searchSpace.pathUseSE,
+        pathMinKernelSizes=searchSpace.pathMinKernelSizes,
+        pathNames=searchSpace.pathNames,
+        auxiliaryHeadStages=searchSpace.auxiliaryHeadStages,
         numClasses=dataBundle.numClasses,
     )
 
@@ -120,6 +136,7 @@ def main() -> None:
         weightDecay=args.weightDecay,
         ampEnabled=args.amp,
         gradientClipNorm=args.gradientClipNorm,
+        auxiliaryLossWeight=args.auxiliaryLossWeight,
         saveDir=args.saveDir,
         evalEveryEpochs=args.evalEveryEpochs,
     )
@@ -139,6 +156,7 @@ def main() -> None:
             epochIndex=epochIndex,
             ampEnabled=trainConfig.ampEnabled,
             gradientClipNorm=trainConfig.gradientClipNorm,
+            auxiliaryLossWeight=trainConfig.auxiliaryLossWeight,
             referenceResolution=args.imageSize,
         )
 
@@ -170,21 +188,26 @@ def main() -> None:
 
             if evalMetrics.top1 > bestTop1:
                 bestTop1 = evalMetrics.top1
-                if isMainProcess():
+                if isMainProcess() and not args.disableCheckpointing:
                     bestPath = Path(trainConfig.saveDir) / "best_model.pth"
-                    torch.save({"model": model.state_dict(), "epoch": epochIndex, "bestTop1": bestTop1}, bestPath)
+                    torch.save(
+                        {"model": model.state_dict(), "epoch": epochIndex, "bestTop1": bestTop1},
+                        bestPath,
+                        _use_new_zipfile_serialization=False,
+                    )
 
         if isMainProcess():
             appendJsonLog(trainConfig.saveDir, metricsForLog)
-            saveCheckpoint(
-                saveDir=trainConfig.saveDir,
-                epochIndex=epochIndex,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-                bestMetric=bestTop1,
-                extraState={"rank": rank},
-            )
+            if not args.disableCheckpointing:
+                saveCheckpoint(
+                    saveDir=trainConfig.saveDir,
+                    epochIndex=epochIndex,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    bestMetric=bestTop1,
+                    extraState={"rank": rank},
+                )
 
     cleanupDistributed()
 

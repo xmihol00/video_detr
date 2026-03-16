@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple, cast
 import json
 import random
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
 
@@ -22,6 +22,7 @@ class TrainConfig:
     weightDecay: float
     ampEnabled: bool
     gradientClipNorm: float
+    auxiliaryLossWeight: float
     saveDir: str
     evalEveryEpochs: int
 
@@ -33,6 +34,20 @@ class EvalResult:
     loss: float
 
 
+def _extractLogitsAndAuxiliary(modelOutputs: object) -> Tuple[Tensor, List[Tensor]]:
+    if isinstance(modelOutputs, tuple):
+        if len(modelOutputs) == 3:
+            logits = cast(Tensor, modelOutputs[0])
+            auxiliaryLogits = cast(List[Tensor], modelOutputs[2])
+            return logits, auxiliaryLogits
+        if len(modelOutputs) >= 1:
+            logits = cast(Tensor, modelOutputs[0])
+            return logits, []
+
+    logits = cast(Tensor, modelOutputs)
+    return logits, []
+
+
 def _sampleBatchArchitecture(referenceResolution: int) -> ArchitectureConfig:
     architecture = sampleRandomArchitecture(DEFAULT_SEARCH_SPACE)
     return ArchitectureConfig(
@@ -41,6 +56,11 @@ def _sampleBatchArchitecture(referenceResolution: int) -> ArchitectureConfig:
         stageDepths=architecture.stageDepths,
         stageWidthMultipliers=architecture.stageWidthMultipliers,
         stemChannels=architecture.stemChannels,
+        stemPathIndex=architecture.stemPathIndex,
+        stagePathIndices=architecture.stagePathIndices,
+        stageKernelSizes=architecture.stageKernelSizes,
+        stageExtraStrides=architecture.stageExtraStrides,
+        enableAuxiliaryHeads=True,
     )
 
 
@@ -53,6 +73,7 @@ def trainOneEpoch(
     epochIndex: int,
     ampEnabled: bool,
     gradientClipNorm: float,
+    auxiliaryLossWeight: float,
     referenceResolution: int,
 ) -> Dict[str, float]:
     model.train()
@@ -78,8 +99,15 @@ def trainOneEpoch(
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=ampEnabled and device.type == "cuda"):
-            logits, _ = model(images, sampledArchitecture)
-            loss = F.cross_entropy(logits, targets)
+            modelOutputs = model(images, sampledArchitecture)
+            logits, auxiliaryLogits = _extractLogitsAndAuxiliary(modelOutputs)
+
+            mainLoss = F.cross_entropy(logits, targets)
+            if auxiliaryLogits:
+                auxLoss = torch.stack([F.cross_entropy(auxLogits, targets) for auxLogits in auxiliaryLogits]).mean()
+                loss = mainLoss + auxiliaryLossWeight * auxLoss
+            else:
+                loss = mainLoss
 
         scaler.scale(loss).backward()
         if gradientClipNorm > 0:
@@ -137,7 +165,8 @@ def evaluate(
                 )
 
             with autocast(enabled=ampEnabled and device.type == "cuda"):
-                logits, _ = model(images, architectureConfig)
+                modelOutputs = model(images, architectureConfig)
+                logits, _ = _extractLogitsAndAuxiliary(modelOutputs)
                 loss = F.cross_entropy(logits, targets)
 
             top1Tensor, top5Tensor = computeTopKAccuracy(logits, targets, topK=(1, 5))
@@ -183,7 +212,7 @@ def saveCheckpoint(
     if extraState is not None:
         state["extraState"] = extraState
 
-    torch.save(state, checkpointPath)
+    torch.save(state, checkpointPath, _use_new_zipfile_serialization=False)
     return str(checkpointPath)
 
 

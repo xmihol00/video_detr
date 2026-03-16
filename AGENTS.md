@@ -20,6 +20,9 @@ If library is a good fit for a particular purpose, install it using `pip install
 ## Repository structure
 ```
 cnnSearch			       # TBD: python scripts that will implement the search of the best CNN architecture for the Sony IMX500 using genetic algorithms
+├──
+tests                      # Unit tests for all the modules in the repository
+├──
 vidDetr
 ├── datasets
 │   ├── __init__.py                    # Re-exports all three dataset classes and their collate functions

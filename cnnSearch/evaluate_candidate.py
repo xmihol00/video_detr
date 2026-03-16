@@ -49,7 +49,8 @@ def evaluateTopK(
                 logits = model(images)
                 loss = F.cross_entropy(logits, targets)
 
-            _, top5 = logits.topk(5, dim=1)
+            maxK = min(5, logits.shape[1])
+            _, top5 = logits.topk(maxK, dim=1)
             correctTop1 = (logits.argmax(dim=1) == targets).float().mean() * 100.0
             correctTop5 = top5.eq(targets.view(-1, 1)).any(dim=1).float().mean() * 100.0
 
@@ -88,6 +89,17 @@ def main() -> None:
         widthMultipliersPerStage=DEFAULT_SEARCH_SPACE.widthMultipliersPerStage,
         baseChannelsPerStage=DEFAULT_SEARCH_SPACE.baseChannelsPerStage,
         stemChannels=DEFAULT_SEARCH_SPACE.stemChannels,
+        stemPathOptions=DEFAULT_SEARCH_SPACE.stemPathOptions,
+        stagePathOptionsPerStage=DEFAULT_SEARCH_SPACE.stagePathOptionsPerStage,
+        stageKernelSizeOptionsPerStage=DEFAULT_SEARCH_SPACE.stageKernelSizeOptionsPerStage,
+        stageExtraStrideOptionsPerStage=DEFAULT_SEARCH_SPACE.stageExtraStrideOptionsPerStage,
+        pathDepthMultipliers=DEFAULT_SEARCH_SPACE.pathDepthMultipliers,
+        pathWidthMultipliers=DEFAULT_SEARCH_SPACE.pathWidthMultipliers,
+        pathDilations=DEFAULT_SEARCH_SPACE.pathDilations,
+        pathUseSE=DEFAULT_SEARCH_SPACE.pathUseSE,
+        pathMinKernelSizes=DEFAULT_SEARCH_SPACE.pathMinKernelSizes,
+        pathNames=DEFAULT_SEARCH_SPACE.pathNames,
+        auxiliaryHeadStages=DEFAULT_SEARCH_SPACE.auxiliaryHeadStages,
         numClasses=valBundle.numClasses,
     )
 

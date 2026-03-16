@@ -7,14 +7,16 @@ from torch import Tensor
 
 
 def computeTopKAccuracy(logits: Tensor, targets: Tensor, topK: Iterable[int] = (1, 5)) -> List[Tensor]:
-    maxK = max(topK)
+    numClasses = logits.shape[1]
+    safeTopK = [min(currentK, numClasses) for currentK in topK]
+    maxK = max(safeTopK)
     _, predictions = logits.topk(maxK, dim=1, largest=True, sorted=True)
     predictions = predictions.t()
     correct = predictions.eq(targets.view(1, -1).expand_as(predictions))
 
     results: List[Tensor] = []
     batchSize = targets.size(0)
-    for currentK in topK:
+    for currentK in safeTopK:
         correctK = correct[:currentK].reshape(-1).float().sum(0)
         results.append(correctK * (100.0 / batchSize))
     return results

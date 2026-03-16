@@ -34,10 +34,11 @@ def testSupernetForwardAndSubnetExtraction() -> None:
     )
 
     inputs = torch.randn(2, 3, 128, 128)
-    logits, returnedArchitecture = supernet(inputs, architecture)
+    logits, returnedArchitecture, auxiliaryLogits = supernet(inputs, architecture)
 
     assert logits.shape == (2, searchSpace.numClasses)
     assert returnedArchitecture.outputStride == architecture.outputStride
+    assert len(auxiliaryLogits) == len(searchSpace.auxiliaryHeadStages)
 
     extracted = extractSubnetFromSupernet(supernet, architectureConfig=architecture, searchSpace=searchSpace)
     subnetLogits = extracted.model(inputs)

@@ -23,4 +23,9 @@ def loadArchitectureConfig(filePath: str) -> ArchitectureConfig:
         stageDepths=[int(value) for value in payload["stageDepths"]],
         stageWidthMultipliers=[float(value) for value in payload["stageWidthMultipliers"]],
         stemChannels=int(payload["stemChannels"]),
+        stemPathIndex=int(payload.get("stemPathIndex", 1)),
+        stagePathIndices=[int(value) for value in payload.get("stagePathIndices", [1, 1, 1, 1])],
+        stageKernelSizes=[int(value) for value in payload.get("stageKernelSizes", [3, 3, 3, 3])],
+        stageExtraStrides=[int(value) for value in payload.get("stageExtraStrides", [1, 1, 1, 1])],
+        enableAuxiliaryHeads=bool(payload.get("enableAuxiliaryHeads", True)),
     )
