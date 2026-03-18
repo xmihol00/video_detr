@@ -189,7 +189,7 @@ def trainOneEpoch(
             key=f"train.epoch.{epochIndex}.metrics",
             everyN=max(1, logIntervalSteps),
             message=(
-                f"Training batch metrics | "
+                f"Training epoch {epochIndex} | "
                 f"loss={float(loss.item()):.4f} "
                 f"top1={float(top1Tensor.item()):.2f} "
                 f"top5={float(top5Tensor.item()):.2f} "
@@ -250,6 +250,7 @@ def evaluate(
     ampEnabled: bool,
     eventLogger: Optional[EventLogger] = None,
     logIntervalSteps: int = 100,
+    epochIndex: Optional[int] = None,
 ) -> EvalResult:
     model.eval()
     activeLogger = eventLogger if eventLogger is not None else LOGGER
@@ -293,11 +294,7 @@ def evaluate(
             activeLogger.logEveryN(
                 key="evaluate.batch.progress",
                 everyN=max(1, logIntervalSteps),
-                message="Evaluation batch progress",
-                step=numSteps,
-                batchLoss=float(loss.item()),
-                batchTop1=float(top1Tensor.item()),
-                batchTop5=float(top5Tensor.item()),
+                message=f"Evaluation epoch {epochIndex} | loss={float(loss.item()):.4f} top1={float(top1Tensor.item()):.2f} top5={float(top5Tensor.item()):.2f}",
             )
 
     metricTensor = torch.tensor(

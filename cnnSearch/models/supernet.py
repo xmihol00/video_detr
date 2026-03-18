@@ -386,37 +386,29 @@ class SlimStageSelector(nn.Module):
         stageStride: int,
         extraStride: int,
     ) -> Tensor:
-        _ = pathPreferenceIndex
         effectiveStride = max(1, stageStride * extraStride)
 
-        pathOutputs: List[Tensor] = []
-        equalWeight = 1.0 / len(self.paths)
+        pathIndex = pathPreferenceIndex
+        if pathIndex < 0 or pathIndex >= len(self.paths):
+            pathIndex = 0
 
-        for pathIndex, path in enumerate(self.paths):
-            pathDepthMultiplier = self.pathDepthMultipliers[pathIndex]
-            activeDepth = max(1, int(round(baseDepth * pathDepthMultiplier)))
-            activeDepth = min(activeDepth, self.pathMaxDepths[pathIndex])
+        path = self.paths[pathIndex]
+        pathDepthMultiplier = self.pathDepthMultipliers[pathIndex]
+        activeDepth = max(1, int(round(baseDepth * pathDepthMultiplier)))
+        activeDepth = min(activeDepth, self.pathMaxDepths[pathIndex])
 
-            pathWidthMultiplier = self.pathWidthMultipliers[pathIndex]
-            activePathOutChannels = alignChannels(int(round(canonicalOutChannels * pathWidthMultiplier)))
-            activePathOutChannels = min(activePathOutChannels, self.pathMaxOutChannels[pathIndex])
+        pathWidthMultiplier = self.pathWidthMultipliers[pathIndex]
+        activePathOutChannels = alignChannels(int(round(canonicalOutChannels * pathWidthMultiplier)))
+        activePathOutChannels = min(activePathOutChannels, self.pathMaxOutChannels[pathIndex])
 
-            pathOutputs.append(
-                path(
-                    inputs,
-                    activeDepth=activeDepth,
-                    activePathOutChannels=activePathOutChannels,
-                    activeCanonicalOutChannels=canonicalOutChannels,
-                    kernelSize=kernelSize,
-                    strideOverride=effectiveStride,
-                )
-            )
-
-        combinedOutput = torch.zeros_like(pathOutputs[0])
-        for pathOutput in pathOutputs:
-            combinedOutput = combinedOutput + equalWeight * pathOutput
-
-        return combinedOutput
+        return path(
+            inputs,
+            activeDepth=activeDepth,
+            activePathOutChannels=activePathOutChannels,
+            activeCanonicalOutChannels=canonicalOutChannels,
+            kernelSize=kernelSize,
+            strideOverride=effectiveStride,
+        )
 
 
 class ResNetSuperNet(nn.Module):

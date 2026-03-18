@@ -42,7 +42,7 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--valDir", type=str, default=None, help="Optional ImageFolder validation root")
 
     parser.add_argument("--epochs", type=int, default=90)
-    parser.add_argument("--batchSize", type=int, default=24)
+    parser.add_argument("--batchSize", type=int, default=20)
     parser.add_argument("--numWorkers", type=int, default=8)
     parser.add_argument("--imageSize", type=int, default=320)
 
@@ -53,9 +53,10 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision training")
     parser.add_argument("--gradientClipNorm", type=float, default=0.0)
     parser.add_argument("--auxiliaryLossWeight", type=float, default=0.3)
+    parser.add_argument("--aux-heads", action="store_true", help="Enable auxiliary classification heads during training")
 
-    parser.add_argument("--saveDir", type=str, default="cnnSearch/outputs/supernet")
-    parser.add_argument("--evalEveryEpochs", type=int, default=1)
+    parser.add_argument("--saveDir", type=str, default="./checkpoints")
+    parser.add_argument("--evalEveryEpochs", type=int, default=10)
     parser.add_argument("--valSplitRatio", type=float, default=0.15)
     parser.add_argument("--disableCheckpointing", action="store_true", help="Skip writing checkpoints and best model files")
 
@@ -158,7 +159,7 @@ def main() -> None:
         pathUseSE=searchSpace.pathUseSE,
         pathMinKernelSizes=searchSpace.pathMinKernelSizes,
         pathNames=searchSpace.pathNames,
-        auxiliaryHeadStages=searchSpace.auxiliaryHeadStages,
+        auxiliaryHeadStages=searchSpace.auxiliaryHeadStages if args.aux_heads else [],
         numClasses=dataBundle.numClasses,
     )
 
@@ -242,6 +243,7 @@ def main() -> None:
                 ampEnabled=trainConfig.ampEnabled,
                 eventLogger=LOGGER,
                 logIntervalSteps=max(1, args.logIntervalSteps * 2),
+                epochIndex=epochIndex,
             )
             metricsForLog.update(
                 {
