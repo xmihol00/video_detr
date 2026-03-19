@@ -42,7 +42,7 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--valDir", type=str, default=None, help="Optional ImageFolder validation root")
 
     parser.add_argument("--epochs", type=int, default=90)
-    parser.add_argument("--batchSize", type=int, default=20)
+    parser.add_argument("--batchSize", type=int, default=72)
     parser.add_argument("--numWorkers", type=int, default=8)
     parser.add_argument("--imageSize", type=int, default=320)
 

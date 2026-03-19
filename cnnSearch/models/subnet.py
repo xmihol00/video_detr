@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, cast
+import math
 
 import torch
 from torch import Tensor, nn
@@ -26,6 +27,7 @@ from cnnSearch.search_space import (
     decodeStageChannels,
     decodeStagePathChannels,
     resolveStagePathDepth,
+    alignChannels,
 )
 
 
@@ -50,6 +52,7 @@ class BasicBlock(nn.Module):
         self.seReduce = nn.Conv2d(outChannels, max(8, outChannels // 4), kernel_size=1, stride=1, padding=0, bias=False)
         self.seExpand = nn.Conv2d(max(8, outChannels // 4), outChannels, kernel_size=1, stride=1, padding=0, bias=False)
 
+        # Match SlimBasicBlock logic: if stride != 1 or in != out, add downsample
         if stride != 1 or inChannels != outChannels:
             self.downsample = nn.Sequential(
                 nn.Conv2d(inChannels, outChannels, kernel_size=1, stride=stride, bias=False),
@@ -71,7 +74,7 @@ class BasicBlock(nn.Module):
         if self.useSE:
             squeeze = F.adaptive_avg_pool2d(outputs, output_size=1)
             squeeze = self.seReduce(squeeze)
-            squeeze = self.relu(squeeze)
+            squeeze = F.relu(squeeze, inplace=True)
             squeeze = self.seExpand(squeeze)
             squeeze = torch.sigmoid(squeeze)
             outputs = outputs * squeeze
@@ -360,6 +363,7 @@ def extractSubnetFromSupernet(
         stageCanonicalChannels = stageChannels[stageIndex]
 
         superStage = cast(SlimStageSelector, superStageAny)
+        # Use simple indexing consistent with updated SlimStageSelector
         selectedSuperPath = cast(SlimStagePath, superStage.paths[stagePathIndex])
 
         subStage = cast(nn.ModuleDict, subStageAny)

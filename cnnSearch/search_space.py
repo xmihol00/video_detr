@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import itertools
+import math
 import random
 from typing import Dict, List
 
@@ -158,3 +160,95 @@ def decodeStagePathChannels(
         pathChannels.append(stagePathChannels)
 
     return pathChannels
+
+
+def countCombinations(searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPACE) -> int:
+    numResolutions = len(searchSpace.inputResolutions)
+    numStemOptions = len(searchSpace.stemChannels) * len(searchSpace.stemPathOptions)
+    numOutputStrides = len(searchSpace.outputStrides)
+
+    stageCombinations = 1
+    for i in range(len(searchSpace.baseChannelsPerStage)):
+        stageOpts = (
+            len(searchSpace.depthOptionsPerStage[i])
+            * len(searchSpace.widthMultipliersPerStage[i])
+            * len(searchSpace.stagePathOptionsPerStage[i])
+            * len(searchSpace.stageKernelSizeOptionsPerStage[i])
+            * len(searchSpace.stageExtraStrideOptionsPerStage[i])
+        )
+        stageCombinations *= stageOpts
+
+    return numResolutions * numStemOptions * numOutputStrides * stageCombinations
+
+
+def calculateSearchSpaceSize(searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPACE) -> int:
+    numGlobal = (
+        len(searchSpace.inputResolutions) * 
+        len(searchSpace.outputStrides) * 
+        len(searchSpace.stemChannels) * 
+        len(searchSpace.stemPathOptions)
+    )
+    
+    stageVariations = 1
+    for i in range(len(searchSpace.baseChannelsPerStage)):
+        stageOpts = (
+            len(searchSpace.depthOptionsPerStage[i]) * 
+            len(searchSpace.widthMultipliersPerStage[i]) * 
+            len(searchSpace.stagePathOptionsPerStage[i]) * 
+            len(searchSpace.stageKernelSizeOptionsPerStage[i]) * 
+            len(searchSpace.stageExtraStrideOptionsPerStage[i])
+        )
+        stageVariations *= stageOpts
+        
+    return numGlobal * stageVariations
+
+
+def iterateAllArchitectures(searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPACE):
+    # Order: Resolution -> OutputStride -> Stem -> Stages
+    
+    # 1. Global options
+    global_options = list(itertools.product(
+        searchSpace.inputResolutions,
+        searchSpace.outputStrides,
+        searchSpace.stemChannels,
+        searchSpace.stemPathOptions
+    ))
+    
+    # 2. Per-stage options pre-calculation
+    stage_sequences = []
+    for i in range(len(searchSpace.baseChannelsPerStage)):
+        stage_opts = list(itertools.product(
+            searchSpace.depthOptionsPerStage[i],
+            searchSpace.widthMultipliersPerStage[i],
+            searchSpace.stagePathOptionsPerStage[i],
+            searchSpace.stageKernelSizeOptionsPerStage[i],
+            searchSpace.stageExtraStrideOptionsPerStage[i]
+        ))
+        stage_sequences.append(stage_opts)
+        
+    # 3. Cartesian product of stages
+    # WARNING: This might still be too large to materialize fully if search space is huge.
+    # We iterate stages dynamically.
+    
+    for (res, stride, stemCh, stemPath) in global_options:
+        for stage_configs in itertools.product(*stage_sequences):
+            # stage_configs contains one tuple per stage: ((d1,w1...), (d2,w2...), ...)
+            
+            stageDepths = [s[0] for s in stage_configs]
+            stageWidths = [s[1] for s in stage_configs]
+            stagePaths = [s[2] for s in stage_configs]
+            stageKernels = [s[3] for s in stage_configs]
+            stageExtraStrides = [s[4] for s in stage_configs]
+            
+            yield ArchitectureConfig(
+                inputResolution=res,
+                outputStride=stride,
+                stageDepths=stageDepths,
+                stageWidthMultipliers=stageWidths,
+                stemChannels=stemCh,
+                stemPathIndex=stemPath,
+                stagePathIndices=stagePaths,
+                stageKernelSizes=stageKernels,
+                stageExtraStrides=stageExtraStrides,
+                enableAuxiliaryHeads=True,
+            )

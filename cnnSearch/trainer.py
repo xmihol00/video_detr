@@ -16,20 +16,7 @@ from cnnSearch.logging_utils import EventLogger, getEventLogger
 from cnnSearch.metrics import computeTopKAccuracy, reduceTensorAverage
 from cnnSearch.search_space import ArchitectureConfig, DEFAULT_SEARCH_SPACE, sampleRandomArchitecture
 
-NUM_GPUS = 1
-
-import safe_gpu
-while True:
-    try:
-        safe_gpu.claim_gpus(NUM_GPUS)
-        break
-    except:
-        print("Waiting for free GPU")
-        time.sleep(5)
-        pass
-
 LOGGER = getEventLogger(__name__)
-
 
 @dataclass(frozen=True)
 class TrainConfig:
