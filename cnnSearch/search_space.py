@@ -76,6 +76,96 @@ DEFAULT_SEARCH_SPACE = SearchSpaceConfig(
     stemChannels=[32, 48, 64],
     stemPathOptions=[0, 1, 2],
     stagePathOptionsPerStage=[
+        [0, 1, 2],
+        [0, 1, 2],
+        [0, 1, 2],
+        [0, 1, 2],
+    ],
+    stageKernelSizeOptionsPerStage=[
+        [3, 5, 7],
+        [3, 5, 7],
+        [3, 5, 7],
+        [3, 5, 7],
+    ],
+    stageExtraStrideOptionsPerStage=[
+        [1],
+        [1, 2],
+        [1, 2],
+        [1, 2],
+    ],
+    pathDepthMultipliers=[0.75, 1.0, 1.25],
+    pathWidthMultipliers=[1.25, 1.0, 0.75],
+    pathDilations=[1, 1, 1],
+    pathUseSE=[False, False, False],
+    pathMinKernelSizes=[3, 3, 3],
+    pathNames=["shortWide", "balanced", "deepNarrow"],
+    auxiliaryHeadStages=[1, 2, 3, 4],
+)
+
+COMPLEX_SEARCH_SPACE = SearchSpaceConfig(
+    inputResolutions=[192, 224, 256, 288, 320],
+    outputStrides=[8, 16, 32],
+    depthOptionsPerStage=[
+        [1, 2, 3],
+        [1, 2, 3, 4],
+        [1, 2, 3, 4, 5, 6],
+        [1, 2, 3],
+    ],
+    widthMultipliersPerStage=[
+        [0.5, 0.75, 1.0],
+        [0.5, 0.75, 1.0],
+        [0.5, 0.75, 1.0],
+        [0.5, 0.75, 1.0],
+    ],
+    baseChannelsPerStage=[64, 128, 256, 512],
+    stemChannels=[32, 48, 64],
+    stemPathOptions=[0, 1, 2],
+    stagePathOptionsPerStage=[
+        [0, 1, 2, 3, 4],
+        [0, 1, 2, 3, 4],
+        [0, 1, 2, 3, 4],
+        [0, 1, 2, 3, 4],
+    ],
+    stageKernelSizeOptionsPerStage=[
+        [3, 5, 7],
+        [3, 5, 7],
+        [3, 5, 7],
+        [3, 5, 7],
+    ],
+    stageExtraStrideOptionsPerStage=[
+        [1],
+        [1, 2],
+        [1, 2],
+        [1, 2],
+    ],
+    pathDepthMultipliers=[0.75, 1.0, 1.25, 1.0, 1.35],
+    pathWidthMultipliers=[1.25, 1.0, 0.75, 1.0, 0.85],
+    pathDilations=[1, 1, 1, 1, 2],
+    pathUseSE=[False, False, False],
+    pathMinKernelSizes=[3, 3, 3],
+    pathNames=["shortWide", "balanced", "deepNarrow"],
+    auxiliaryHeadStages=[1, 2, 3, 4],
+)
+
+COMPLEX_SEARCH_SPACE = SearchSpaceConfig(
+    inputResolutions=[192, 224, 256, 288, 320],
+    outputStrides=[8, 16, 32],
+    depthOptionsPerStage=[
+        [1, 2, 3],
+        [1, 2, 3, 4],
+        [1, 2, 3, 4, 5, 6],
+        [1, 2, 3],
+    ],
+    widthMultipliersPerStage=[
+        [0.5, 0.75, 1.0],
+        [0.5, 0.75, 1.0],
+        [0.5, 0.75, 1.0],
+        [0.5, 0.75, 1.0],
+    ],
+    baseChannelsPerStage=[64, 128, 256, 512],
+    stemChannels=[32, 48, 64],
+    stemPathOptions=[0, 1, 2],
+    stagePathOptionsPerStage=[
         [0, 1, 2, 3, 4],
         [0, 1, 2, 3, 4],
         [0, 1, 2, 3, 4],
@@ -101,6 +191,9 @@ DEFAULT_SEARCH_SPACE = SearchSpaceConfig(
     pathNames=["shortWide", "balanced", "deepNarrow", "largeKernelSE", "dilatedSE"],
     auxiliaryHeadStages=[1, 2, 3, 4],
 )
+
+def getSearchSpace(useComplexPaths: bool = False) -> SearchSpaceConfig:
+    return COMPLEX_SEARCH_SPACE if useComplexPaths else DEFAULT_SEARCH_SPACE
 
 
 def sampleRandomArchitecture(searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPACE) -> ArchitectureConfig:

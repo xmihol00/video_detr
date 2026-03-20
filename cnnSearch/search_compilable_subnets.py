@@ -18,12 +18,15 @@ from cnnSearch.search_space import (
     DEFAULT_SEARCH_SPACE, 
     ArchitectureConfig,
     calculateSearchSpaceSize,
-    iterateAllArchitectures
+    iterateAllArchitectures,
+    getSearchSpace
 )
 from cnnSearch.export_utils import Imx500Exporter, RepresentativeDataGenerator
 
 DB_PATH = "compilation_search.json"
 CALIBRATION_IMAGES_DIR = os.path.join(os.path.dirname(__file__), "calibration_images")
+# Will be initialized in main based on args
+SEARCH_SPACE = DEFAULT_SEARCH_SPACE
 
 def get_param_count(model):
     return sum(p.numel() for p in model.parameters())
@@ -53,7 +56,7 @@ def populate_candidates(target_count=None):
     experiments = load_db()
     existing_hashes = {get_config_hash(e['config']) for e in experiments}
     
-    supernet = ResNetSuperNet(DEFAULT_SEARCH_SPACE)
+    supernet = ResNetSuperNet(SEARCH_SPACE)
     
     # Determine next ID
     next_id = 1
@@ -65,7 +68,7 @@ def populate_candidates(target_count=None):
 
     if is_exhaustive:
         print("Mode: EXHAUSTIVE. generating all possible architectures...")
-        generator = iterateAllArchitectures(DEFAULT_SEARCH_SPACE)
+        generator = iterateAllArchitectures(SEARCH_SPACE)
     else:
         current_count = len(experiments)
         if current_count >= target_count:
@@ -73,7 +76,7 @@ def populate_candidates(target_count=None):
             return
         to_generate = target_count - current_count
         print(f"Mode: SAMPLING. Generating {to_generate} random architectures...")
-        generator = (sampleRandomArchitecture(DEFAULT_SEARCH_SPACE) for _ in range(to_generate))
+        generator = (sampleRandomArchitecture(SEARCH_SPACE) for _ in range(to_generate))
 
     # Iterate through the generator (either exhaustive or random range)
     # Note: For random sampling, we might hit duplicates, so we might need a while loop logic, 
@@ -137,7 +140,7 @@ def attempt_compilation(config_data, experiment_id):
 
         config = ArchitectureConfig(**config_dict)
         
-        supernet = ResNetSuperNet(DEFAULT_SEARCH_SPACE)
+        supernet = ResNetSuperNet(SEARCH_SPACE)
         subnet_data = extractSubnetFromSupernet(supernet, config)
         model = subnet_data.model
         
@@ -270,12 +273,22 @@ def search_loop(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-samples", type=int, default=None, help="Number of random samples to generate. If not set, exhaustive search is performed.")
+    parser.add_argument("--enable-complex-paths", action="store_true", help="Enable complex SE and dilated paths (paths 3 and 4) which are disabled by default")
     args = parser.parse_args()
+    
+    global SEARCH_SPACE
+    from cnnSearch.search_space import getSearchSpace
+    SEARCH_SPACE = getSearchSpace(useComplexPaths=args.enable_complex_paths)
+    
+    if args.enable_complex_paths:
+        print("Enabling complex SE and dilated paths (paths 3 and 4)")
+    else:
+        print("Using simplified search space (paths 0, 1, 2 only)")
     
     init_db()
 
     # Logging combinatorics
-    total_combinations = calculateSearchSpaceSize(DEFAULT_SEARCH_SPACE)
+    total_combinations = calculateSearchSpaceSize(SEARCH_SPACE)
     print("=" * 60)
     print(f"Total possible architectures in search space: {total_combinations:,}")
     

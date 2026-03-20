@@ -54,6 +54,9 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--gradientClipNorm", type=float, default=0.0)
     parser.add_argument("--auxiliaryLossWeight", type=float, default=0.3)
     parser.add_argument("--aux-heads", action="store_true", help="Enable auxiliary classification heads during training")
+    
+    # New argument to enable SE paths (index 3 and 4) which are now disabled by default
+    parser.add_argument("--enable-complex-paths", action="store_true", help="Enable complex SE and dilated paths (paths 3 and 4) which are disabled by default")
 
     parser.add_argument("--saveDir", type=str, default="./checkpoints")
     parser.add_argument("--evalEveryEpochs", type=int, default=10)
@@ -142,6 +145,14 @@ def main() -> None:
     )
 
     searchSpace = DEFAULT_SEARCH_SPACE
+    if args.enable_complex_paths:
+        from cnnSearch.search_space import COMPLEX_SEARCH_SPACE
+        searchSpace = COMPLEX_SEARCH_SPACE
+        LOGGER.info("Enabling complex SE and dilated paths (paths 3 and 4)")
+    else:
+        LOGGER.info("Using simplified search space (paths 0, 1, 2 only)")
+
+    # Update auxiliary heads config based on args
     searchSpace = type(searchSpace)(
         inputResolutions=searchSpace.inputResolutions,
         outputStrides=searchSpace.outputStrides,
@@ -234,6 +245,14 @@ def main() -> None:
             "learningRate": scheduler.get_last_lr()[0],
         }
 
+        # Log epoch summary clearly
+        if isMainProcess():
+            print("\n" + "="*60)
+            print(f"EPOCH {epochIndex} COMPLETED")
+            print(f"TRAIN Average Loss: {trainMetrics['loss']:.4f}")
+            print(f"TRAIN Top-1 Acc:    {trainMetrics['top1']:.2f}%")
+            print(f"TRAIN Top-5 Acc:    {trainMetrics['top5']:.2f}%")
+
         if epochIndex % trainConfig.evalEveryEpochs == 0:
             evalMetrics = evaluate(
                 model=model,
@@ -252,17 +271,28 @@ def main() -> None:
                     "valTop5": evalMetrics.top5,
                 }
             )
+            
+            if isMainProcess():
+                print(f"VAL   Average Loss: {evalMetrics.loss:.4f}")
+                print(f"VAL   Top-1 Acc:    {evalMetrics.top1:.2f}%")
+                print(f"VAL   Top-5 Acc:    {evalMetrics.top5:.2f}%")
 
             if evalMetrics.top1 > bestTop1:
                 bestTop1 = evalMetrics.top1
                 if isMainProcess() and not args.disableCheckpointing:
                     bestPath = Path(trainConfig.saveDir) / "best_model.pth"
-                    torch.save(
-                        {"model": model.state_dict(), "epoch": epochIndex, "bestTop1": bestTop1},
-                        bestPath,
-                        _use_new_zipfile_serialization=False,
-                    )
-                    LOGGER.info("Saved new best model", epoch=epochIndex, bestTop1=bestTop1, bestPath=str(bestPath))
+                    try:
+                        torch.save(
+                            {"model": model.state_dict(), "epoch": epochIndex, "bestTop1": bestTop1},
+                            bestPath,
+                            _use_new_zipfile_serialization=False,
+                        )
+                        LOGGER.info("Saved new best model", epoch=epochIndex, bestTop1=bestTop1, bestPath=str(bestPath))
+                    except Exception as e:
+                        LOGGER.error("Failed to save best model", error=str(e))
+        
+        if isMainProcess():
+            print("="*60 + "\n")
 
         if isMainProcess():
             appendJsonLog(trainConfig.saveDir, metricsForLog)
@@ -276,6 +306,20 @@ def main() -> None:
                     bestMetric=bestTop1,
                     extraState={"rank": rank},
                 )
+            
+            # Print End of Epoch Summary
+            print("\n" + "="*50)
+            print(f"End of Epoch {epochIndex} Summary:")
+            print(f"  Train Loss: {trainMetrics['loss']:.4f}")
+            print(f"  Train Top1: {trainMetrics['top1']:.2f}%")
+            print(f"  Train Top5: {trainMetrics['top5']:.2f}%")
+            if "valLoss" in metricsForLog:
+                print(f"  Val   Loss: {metricsForLog['valLoss']:.4f}")
+                print(f"  Val   Top1: {metricsForLog['valTop1']:.2f}%")
+                print(f"  Val   Top5: {metricsForLog['valTop5']:.2f}%")
+            print(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+            print(f"  Best Val Top1: {bestTop1:.2f}%")
+            print("="*50 + "\n")
 
         LOGGER.info(
             "Epoch completed",
