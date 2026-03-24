@@ -1,5 +1,6 @@
 
 import glob
+import inspect
 import os
 import torch
 import onnx
@@ -113,6 +114,41 @@ class Imx500Exporter:
             tpc_version=tpc_version, 
             device_type="imx500"
         )
+
+    def _withPatchedTorchOnnxExport(self):
+        originalExport = torch.onnx.export
+        exportSignature = inspect.signature(originalExport)
+        supportsDynamo = "dynamo" in exportSignature.parameters
+
+        def _patchedExport(*args, **kwargs):
+            if supportsDynamo and "dynamo" not in kwargs:
+                kwargs["dynamo"] = False
+            return originalExport(*args, **kwargs)
+
+        return originalExport, _patchedExport
+
+    def _exportQuantizedModelStatic(self, quantizedModel, representative_data_gen, output_path):
+        sampleInput = next(representative_data_gen())
+        if isinstance(sampleInput, list):
+            sampleArgs = tuple(sampleInput)
+        elif isinstance(sampleInput, tuple):
+            sampleArgs = sampleInput
+        else:
+            sampleArgs = (sampleInput,)
+
+        # Export with fixed input shape and no dynamic axes to avoid dynamo dynamic-shape validation issues.
+        torch.onnx.export(
+            quantizedModel,
+            sampleArgs,
+            output_path,
+            input_names=[f"input_{i}" for i in range(len(sampleArgs))] if len(sampleArgs) > 1 else ["input"],
+            output_names=["output"],
+            dynamic_axes=None,
+            opset_version=20,
+            verbose=False,
+            do_constant_folding=True,
+            training=torch.onnx.TrainingMode.EVAL,
+        )
     
     def quantize(self, model, representative_data_gen, output_path):
         model.to(device=self.device)
@@ -123,12 +159,21 @@ class Imx500Exporter:
             representative_data_gen=representative_data_gen,
             target_platform_capabilities=self.tpc
         )
-        
-        mct.exporter.pytorch_export_model(
-            model=quantized_model,
-            save_model_path=output_path,
-            repr_dataset=representative_data_gen,
-            serialization_format=mct.exporter.PytorchExportSerializationFormat.ONNX
-        )
+        quantized_model.eval()
+
+        originalExport, patchedExport = self._withPatchedTorchOnnxExport()
+        torch.onnx.export = patchedExport
+        try:
+            mct.exporter.pytorch_export_model(
+                model=quantized_model,
+                save_model_path=output_path,
+                repr_dataset=representative_data_gen,
+                serialization_format=mct.exporter.PytorchExportSerializationFormat.ONNX
+            )
+        except Exception:
+            # Fallback to fully static ONNX export path if MCT exporter hits dynamo/dynamic-shape issues.
+            self._exportQuantizedModelStatic(quantized_model, representative_data_gen, output_path)
+        finally:
+            torch.onnx.export = originalExport
         
         return quantized_model, quant_info

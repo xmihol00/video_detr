@@ -21,6 +21,13 @@ def _createTinyImageFolder(rootPath: Path) -> None:
             image.save(classDir / f"image_{imageIndex}.jpg")
 
 
+def _createSingleImageClass(rootPath: Path, className: str, colorValue: int) -> None:
+    classDir = rootPath / className
+    classDir.mkdir(parents=True, exist_ok=True)
+    image = Image.new("RGB", (32, 32), color=(colorValue, 10, 10))
+    image.save(classDir / "sample.jpg")
+
+
 def testSupernetForwardAndSubnetExtraction() -> None:
     searchSpace = DEFAULT_SEARCH_SPACE
     supernet = ResNetSuperNet(searchSpace=searchSpace)
@@ -71,3 +78,34 @@ def testImageFolderLoaderWithAutoSplit() -> None:
         assert valBatchImages.shape[0] > 0
         assert valBatchTargets.ndim == 1
         assert dataBundle.numClasses == 2
+
+
+def testImageFolderLoaderRemapsExplicitValClassIndicesToTrainSpace() -> None:
+    with tempfile.TemporaryDirectory() as tempDir:
+        tempRoot = Path(tempDir)
+        trainRoot = tempRoot / "train"
+        valRoot = tempRoot / "val"
+
+        _createSingleImageClass(trainRoot, "class_a", 40)
+        _createSingleImageClass(trainRoot, "class_b", 90)
+        _createSingleImageClass(trainRoot, "class_c", 140)
+
+        # Validation intentionally omits class_a. Without remapping this would become targets {0, 1}.
+        _createSingleImageClass(valRoot, "class_b", 80)
+        _createSingleImageClass(valRoot, "class_c", 130)
+
+        dataBundle = buildImageFolderLoaders(
+            trainDir=str(trainRoot),
+            valDir=str(valRoot),
+            imageSize=64,
+            batchSize=4,
+            numWorkers=0,
+            distributed=False,
+        )
+
+        valTargets = []
+        for _, targets in dataBundle.valLoader:
+            valTargets.extend(targets.tolist())
+
+        assert dataBundle.numClasses == 3
+        assert set(valTargets) == {1, 2}

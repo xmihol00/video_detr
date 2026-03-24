@@ -19,7 +19,8 @@ from cnnSearch.search_space import (
     ArchitectureConfig,
     calculateSearchSpaceSize,
     iterateAllArchitectures,
-    getSearchSpace
+    getSearchSpace,
+    normalizeArchitectureForSearchSpace,
 )
 from cnnSearch.export_utils import Imx500Exporter, RepresentativeDataGenerator
 
@@ -27,6 +28,24 @@ DB_PATH = "compilation_search.json"
 CALIBRATION_IMAGES_DIR = os.path.join(os.path.dirname(__file__), "calibration_images")
 # Will be initialized in main based on args
 SEARCH_SPACE = DEFAULT_SEARCH_SPACE
+
+
+def logEvent(eventType, message):
+    """Print concise, emoji-like logs for easy progress scanning."""
+    icons = {
+        "START": "🚀",
+        "INFO": "ℹ️",
+        "CHECK": "🔍",
+        "SUCCESS": "✅",
+        "FAILED": "❌",
+        "PROGRESS": "📈",
+        "SAVE": "💾",
+        "WARN": "⚠️",
+        "DONE": "🏁",
+        "DENSE": "🧪",
+    }
+    icon = icons.get(eventType, "📌")
+    print(f"{icon} [{eventType}] {message}")
 
 def get_param_count(model):
     return sum(p.numel() for p in model.parameters())
@@ -57,25 +76,25 @@ def populate_candidates(target_count=None):
     existing_hashes = {get_config_hash(e['config']) for e in experiments}
     
     supernet = ResNetSuperNet(SEARCH_SPACE)
+    supernet.eval()
     
     # Determine next ID
     next_id = 1
     if experiments:
         next_id = max(e['id'] for e in experiments) + 1
 
-    configs_source = []
     is_exhaustive = target_count is None
 
     if is_exhaustive:
-        print("Mode: EXHAUSTIVE. generating all possible architectures...")
+        logEvent("START", "Mode EXHAUSTIVE: generating all possible architectures")
         generator = iterateAllArchitectures(SEARCH_SPACE)
     else:
         current_count = len(experiments)
         if current_count >= target_count:
-            print(f"DB has {current_count} candidates, target is {target_count}. Skipping population.")
+            logEvent("INFO", f"DB has {current_count} candidates, target is {target_count}. Skipping population")
             return
         to_generate = target_count - current_count
-        print(f"Mode: SAMPLING. Generating {to_generate} random architectures...")
+        logEvent("START", f"Mode SAMPLING: generating {to_generate} random architectures")
         generator = (sampleRandomArchitecture(SEARCH_SPACE) for _ in range(to_generate))
 
     # Iterate through the generator (either exhaustive or random range)
@@ -91,14 +110,16 @@ def populate_candidates(target_count=None):
             if not is_exhaustive and len(experiments) >= target_count:
                 break
 
-            config_dict = config.toDict()
+            staticConfig = normalizeArchitectureForSearchSpace(config, SEARCH_SPACE, enableAuxiliaryHeads=False)
+            config_dict = staticConfig.toDict()
             config_hash = get_config_hash(config_dict)
             
             if config_hash in existing_hashes:
                 continue
 
             # Extract subnet to count parameters accurately
-            subnet_data = extractSubnetFromSupernet(supernet, config)
+            subnet_data = extractSubnetFromSupernet(supernet, staticConfig, searchSpace=SEARCH_SPACE)
+            subnet_data.model.eval()
             param_count = get_param_count(subnet_data.model)
             
             experiments.append({
@@ -114,19 +135,19 @@ def populate_candidates(target_count=None):
             
             # Periodically save to allow resume
             if added_count % 100 == 0:
-                print(f"Generated {added_count} candidates so far...")
+                logEvent("PROGRESS", f"Generated {added_count} new candidates so far")
                 save_db(experiments)
                 
     except KeyboardInterrupt:
-        print("Population interrupted by user. Saving current progress...")
+        logEvent("WARN", "Population interrupted by user. Saving current progress")
         save_db(experiments)
         return
 
     if added_count > 0:
-        print(f"Population finished. Added {added_count} new candidates.")
+        logEvent("DONE", f"Population finished. Added {added_count} new candidates")
         save_db(experiments)
     else:
-        print("No new candidates added.")
+        logEvent("INFO", "No new candidates added")
 
 def attempt_compilation(config_data, experiment_id):
     output_onnx = f"temp_quant_{experiment_id}.onnx"
@@ -138,11 +159,14 @@ def attempt_compilation(config_data, experiment_id):
         else:
             config_dict = config_data
 
-        config = ArchitectureConfig(**config_dict)
+        parsedConfig = ArchitectureConfig(**config_dict)
+        config = normalizeArchitectureForSearchSpace(parsedConfig, SEARCH_SPACE, enableAuxiliaryHeads=False)
         
         supernet = ResNetSuperNet(SEARCH_SPACE)
-        subnet_data = extractSubnetFromSupernet(supernet, config)
+        supernet.eval()
+        subnet_data = extractSubnetFromSupernet(supernet, config, searchSpace=SEARCH_SPACE)
         model = subnet_data.model
+        model.eval()
         
         # Prepare for export
         calib_gen = RepresentativeDataGenerator(
@@ -184,6 +208,7 @@ def attempt_compilation(config_data, experiment_id):
         if os.path.exists(output_compile_dir):
             shutil.rmtree(output_compile_dir)
             
+        logEvent("SUCCESS", f"Compilation succeeded for candidate {experiment_id}")
         return "SUCCESS", None
 
     except Exception as e:
@@ -199,6 +224,7 @@ def attempt_compilation(config_data, experiment_id):
             except OSError:
                 pass
 
+        logEvent("FAILED", f"Compilation failed for candidate {experiment_id}: {e}")
         traceback.print_exc() # Uncomment for debugging
         return "FAILED", str(e)
 
@@ -206,7 +232,7 @@ def search_loop(args):
     experiments = load_db()
     
     if not experiments:
-        print("No experiments found.")
+        logEvent("WARN", "No experiments found")
         return
 
     # Sort by param_count
@@ -216,7 +242,7 @@ def search_loop(args):
     low = 0
     high = len(experiments) - 1
     
-    print(f"Starting binary search on {len(experiments)} ordered candidates...")
+    logEvent("START", f"Starting binary search on {len(experiments)} ordered candidates")
     
     mid = 0
     while low <= high:
@@ -226,28 +252,28 @@ def search_loop(args):
         status = exp.get('status', 'PENDING')
         
         if status == "PENDING":
-             print(f"Checking candidate {exp['id']} (Params: {exp['param_count']})...")
-             res_status, error_msg = attempt_compilation(exp['config'], exp['id'])
-             
-             # Update in-memory and save
-             exp['status'] = res_status
-             exp['error_msg'] = error_msg
-             # Update status for loop logic
-             status = res_status
-             save_db(experiments)
+                        logEvent("CHECK", f"Checking candidate {exp['id']} (Params: {exp['param_count']})")
+                        res_status, error_msg = attempt_compilation(exp['config'], exp['id'])
+
+                        # Update in-memory and save
+                        exp['status'] = res_status
+                        exp['error_msg'] = error_msg
+                        # Update status for loop logic
+                        status = res_status
+                        save_db(experiments)
         
         if status == "SUCCESS":
             # If success, we can try larger models (higher index)
             # The boundary is to the right
             low = mid + 1
-            print(f"Candidate {exp['id']} SUCCESS. Moving search higher -> range [{low}, {high}]")
+            logEvent("SUCCESS", f"Candidate {exp['id']} compilable. Moving search higher -> range [{low}, {high}]")
         else:
             # If failed, we need simpler models (lower index)
             # The boundary is to the left
             high = mid - 1
-            print(f"Candidate {exp['id']} FAILED. Moving search lower -> range [{low}, {high}]")
+            logEvent("FAILED", f"Candidate {exp['id']} not compilable. Moving search lower -> range [{low}, {high}]")
 
-    print(f"Binary search converged at index {mid} (approximate boundary).")
+    logEvent("DONE", f"Binary search converged at index {mid} (approximate boundary)")
     
     # Dense search around boundary
     # Check +/- 50 candidates around the found boundary
@@ -257,18 +283,18 @@ def search_loop(args):
     start_dense = max(0, boundary_idx - dense_range_width)
     end_dense = min(len(experiments), boundary_idx + dense_range_width)
     
-    print(f"Starting dense search in range [{start_dense}, {end_dense}]...")
+    logEvent("DENSE", f"Starting dense search in range [{start_dense}, {end_dense}]")
     
     for idx in range(start_dense, end_dense):
         exp = experiments[idx]
         
         if exp.get('status', 'PENDING') == "PENDING":
-             print(f"Dense Check: Candidate {exp['id']} (Params: {exp['param_count']})...")
-             res_status, error_msg = attempt_compilation(exp['config'], exp['id'])
-             
-             exp['status'] = res_status
-             exp['error_msg'] = error_msg
-             save_db(experiments)
+                        logEvent("DENSE", f"Dense check candidate {exp['id']} (Params: {exp['param_count']})")
+                        res_status, error_msg = attempt_compilation(exp['config'], exp['id'])
+
+                        exp['status'] = res_status
+                        exp['error_msg'] = error_msg
+                        save_db(experiments)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -281,34 +307,34 @@ def main():
     SEARCH_SPACE = getSearchSpace(useComplexPaths=args.enable_complex_paths)
     
     if args.enable_complex_paths:
-        print("Enabling complex SE and dilated paths (paths 3 and 4)")
+        logEvent("INFO", "Enabling complex SE and dilated paths (paths 3 and 4)")
     else:
-        print("Using simplified search space (paths 0, 1, 2 only)")
+        logEvent("INFO", "Using simplified search space (paths 0, 1, 2 only)")
     
     init_db()
 
     # Logging combinatorics
     total_combinations = calculateSearchSpaceSize(SEARCH_SPACE)
-    print("=" * 60)
-    print(f"Total possible architectures in search space: {total_combinations:,}")
+    print("\n" + "=" * 60)
+    logEvent("INFO", f"Total possible architectures in search space: {total_combinations:,}")
     
     current_db = load_db()
     pending_count = sum(1 for e in current_db if e.get('status') == 'PENDING')
     completed_count = sum(1 for e in current_db if e.get('status') in ['SUCCESS', 'FAILED'])
-    print(f"Existing candidates in DB: {len(current_db):,}")
-    print(f"  - Pending: {pending_count:,}")
-    print(f"  - Completed: {completed_count:,}")
+    logEvent("INFO", f"Existing candidates in DB: {len(current_db):,}")
+    logEvent("INFO", f"Pending: {pending_count:,}")
+    logEvent("INFO", f"Completed: {completed_count:,}")
     
     if args.num_samples is None:
-        print("Mode: EXHAUSTIVE SEARCH (checking ALL combinations)")
+        logEvent("START", "Mode EXHAUSTIVE SEARCH (checking ALL combinations)")
     else:
-        print(f"Mode: RANDOM SAMPLING (target: {args.num_samples} candidates)")
-    print("=" * 60)
+        logEvent("START", f"Mode RANDOM SAMPLING (target: {args.num_samples} candidates)")
+    print("=" * 60 + "\n")
 
     try:
         populate_candidates(args.num_samples)
     except Exception as e:
-        print(f"Error during population: {e}")
+        logEvent("FAILED", f"Error during population: {e}")
         # Continue to search loop even if population failed/stopped
         pass
 

@@ -1,5 +1,48 @@
 # PROGRESS
 
+## 2026-03-23
+
+- Fixed a validation-label indexing bug in `cnnSearch/data.py` for explicit `valDir` usage:
+  - validation class IDs are now remapped into the training class index space,
+  - loader now raises a clear error if validation contains classes absent from training.
+- Fixed a major supernet validation reliability issue in `cnnSearch/trainer.py`:
+  - added BatchNorm statistics recalibration on a configurable number of train batches before evaluation,
+  - integrated calibration into `evaluate()` via `bnCalibrationLoader` and `bnCalibrationSteps`.
+- Improved architecture consistency between train/eval paths:
+  - `trainOneEpoch()` now samples from the active search space (including complex paths when enabled),
+  - evaluation architecture in `cnnSearch/train_supernet.py` is now built from the active search space instead of hardcoded default-space assumptions.
+- Added regression tests:
+  - explicit train/val class-index remapping test in `tests/test_cnn_search_supernet.py`,
+  - BatchNorm recalibration running-stats update test in `tests/test_trainer_validation.py`.
+- Validation run:
+  - `pytest -q tests/test_cnn_search_supernet.py tests/test_trainer_validation.py` → `4 passed`.
+- Fixed compilation candidate materialization to be explicitly static before export:
+  - added `normalizeArchitectureForSearchSpace()` in `cnnSearch/search_space.py` to clamp every architecture field to legal options for the active search space,
+  - removed duplicate intermediate `COMPLEX_SEARCH_SPACE` declaration and kept a single canonical complex-space definition.
+- Updated `cnnSearch/search_compilable_subnets.py`:
+  - candidate population now normalizes configs before hashing and subnet extraction,
+  - compilation path normalizes DB-loaded configs again before export,
+  - enforced `eval()` mode on supernet and extracted subnet before quantization/export.
+- Updated `cnnSearch/export_utils.py` to enforce `quantized_model.eval()` before ONNX serialization to avoid train-mode export behavior during compilation search.
+- Added robust ONNX export hardening in `cnnSearch/export_utils.py` for MCT + newer PyTorch:
+  - temporarily patches `torch.onnx.export` to force `dynamo=False` during MCT ONNX export,
+  - adds fallback static ONNX export (`dynamic_axes=None`) when MCT exporter still fails due to dynamic-shape validation mismatches.
+- Added regression test `tests/test_search_space_normalization.py` to guarantee normalization emits only valid static architecture choices.
+- Fixed validation schedule behavior in `cnnSearch/train_supernet.py`:
+  - replaced zero-based `epochIndex % evalEveryEpochs == 0` trigger with one-based scheduling helper,
+  - validation now runs every N epochs in one-based counting and always runs on the final epoch.
+- Added `shouldEvaluateOnEpoch()` in `cnnSearch/trainer.py` and regression tests in `tests/test_training_schedule.py`.
+- Added periodic checkpoint cadence control:
+  - new CLI argument `--save-every-epoch` in `cnnSearch/train_supernet.py` (default `0` means never write periodic checkpoints),
+  - new helper `shouldSaveCheckpointOnEpoch()` in `cnnSearch/trainer.py` for one-based checkpoint cadence,
+  - best model saving is now independent and always happens on validation improvement,
+  - `--disableCheckpointing` now disables periodic checkpoints only.
+- Extended `tests/test_training_schedule.py` with checkpoint cadence tests.
+- Validation run:
+  - `pytest -q tests/test_training_schedule.py tests/test_search_space_normalization.py tests/test_cnn_search_supernet.py tests/test_trainer_validation.py` → `11 passed`.
+- Validation run:
+  - `pytest -q tests/test_search_space_normalization.py tests/test_cnn_search_supernet.py tests/test_trainer_validation.py` → `5 passed`.
+
 ## 2026-03-16
 
 - Enforced **strict equal-weight fusion** across all stage paths in `cnnSearch/models/supernet.py` (removed preferred-path weighting behavior).

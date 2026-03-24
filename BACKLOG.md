@@ -14,3 +14,4 @@
 10. Add rank-correlation checks between supernet proxy ranking and standalone subnet retraining.
 11. Add HPC launcher scripts for long-running search experiments.
 12. Add GA-focused unit tests and deterministic replay tests.
+13. Add end-to-end validation sanity checks (class-index consistency and BN-recalibrated eval baselines) to catch silent metric regressions early.

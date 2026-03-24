@@ -141,51 +141,6 @@ COMPLEX_SEARCH_SPACE = SearchSpaceConfig(
     pathDepthMultipliers=[0.75, 1.0, 1.25, 1.0, 1.35],
     pathWidthMultipliers=[1.25, 1.0, 0.75, 1.0, 0.85],
     pathDilations=[1, 1, 1, 1, 2],
-    pathUseSE=[False, False, False],
-    pathMinKernelSizes=[3, 3, 3],
-    pathNames=["shortWide", "balanced", "deepNarrow"],
-    auxiliaryHeadStages=[1, 2, 3, 4],
-)
-
-COMPLEX_SEARCH_SPACE = SearchSpaceConfig(
-    inputResolutions=[192, 224, 256, 288, 320],
-    outputStrides=[8, 16, 32],
-    depthOptionsPerStage=[
-        [1, 2, 3],
-        [1, 2, 3, 4],
-        [1, 2, 3, 4, 5, 6],
-        [1, 2, 3],
-    ],
-    widthMultipliersPerStage=[
-        [0.5, 0.75, 1.0],
-        [0.5, 0.75, 1.0],
-        [0.5, 0.75, 1.0],
-        [0.5, 0.75, 1.0],
-    ],
-    baseChannelsPerStage=[64, 128, 256, 512],
-    stemChannels=[32, 48, 64],
-    stemPathOptions=[0, 1, 2],
-    stagePathOptionsPerStage=[
-        [0, 1, 2, 3, 4],
-        [0, 1, 2, 3, 4],
-        [0, 1, 2, 3, 4],
-        [0, 1, 2, 3, 4],
-    ],
-    stageKernelSizeOptionsPerStage=[
-        [3, 5, 7],
-        [3, 5, 7],
-        [3, 5, 7],
-        [3, 5, 7],
-    ],
-    stageExtraStrideOptionsPerStage=[
-        [1],
-        [1, 2],
-        [1, 2],
-        [1, 2],
-    ],
-    pathDepthMultipliers=[0.75, 1.0, 1.25, 1.0, 1.35],
-    pathWidthMultipliers=[1.25, 1.0, 0.75, 1.0, 0.85],
-    pathDilations=[1, 1, 1, 1, 2],
     pathUseSE=[False, False, False, True, True],
     pathMinKernelSizes=[3, 3, 3, 5, 3],
     pathNames=["shortWide", "balanced", "deepNarrow", "largeKernelSE", "dilatedSE"],
@@ -194,6 +149,64 @@ COMPLEX_SEARCH_SPACE = SearchSpaceConfig(
 
 def getSearchSpace(useComplexPaths: bool = False) -> SearchSpaceConfig:
     return COMPLEX_SEARCH_SPACE if useComplexPaths else DEFAULT_SEARCH_SPACE
+
+
+def _selectNearestOption(candidateValue: float, availableOptions: List[float]) -> float:
+    return min(availableOptions, key=lambda option: abs(option - candidateValue))
+
+
+def normalizeArchitectureForSearchSpace(
+    architectureConfig: ArchitectureConfig,
+    searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPACE,
+    enableAuxiliaryHeads: bool = False,
+) -> ArchitectureConfig:
+    """Convert a potentially stale architecture config into a static valid config for this search space."""
+    stageCount = len(searchSpace.baseChannelsPerStage)
+
+    stageDepths = [
+        int(_selectNearestOption(float(architectureConfig.stageDepths[i]), [float(v) for v in searchSpace.depthOptionsPerStage[i]]))
+        for i in range(stageCount)
+    ]
+    stageWidthMultipliers = [
+        float(_selectNearestOption(float(architectureConfig.stageWidthMultipliers[i]), searchSpace.widthMultipliersPerStage[i]))
+        for i in range(stageCount)
+    ]
+
+    stagePathIndices = []
+    stageKernelSizes = []
+    stageExtraStrides = []
+    for stageIndex in range(stageCount):
+        pathOptions = searchSpace.stagePathOptionsPerStage[stageIndex]
+        kernelOptions = searchSpace.stageKernelSizeOptionsPerStage[stageIndex]
+        strideOptions = searchSpace.stageExtraStrideOptionsPerStage[stageIndex]
+
+        stagePathIndices.append(
+            int(_selectNearestOption(float(architectureConfig.stagePathIndices[stageIndex]), [float(v) for v in pathOptions]))
+        )
+        stageKernelSizes.append(
+            int(_selectNearestOption(float(architectureConfig.stageKernelSizes[stageIndex]), [float(v) for v in kernelOptions]))
+        )
+        stageExtraStrides.append(
+            int(_selectNearestOption(float(architectureConfig.stageExtraStrides[stageIndex]), [float(v) for v in strideOptions]))
+        )
+
+    inputResolution = int(_selectNearestOption(float(architectureConfig.inputResolution), [float(v) for v in searchSpace.inputResolutions]))
+    outputStride = int(_selectNearestOption(float(architectureConfig.outputStride), [float(v) for v in searchSpace.outputStrides]))
+    stemChannels = int(_selectNearestOption(float(architectureConfig.stemChannels), [float(v) for v in searchSpace.stemChannels]))
+    stemPathIndex = int(_selectNearestOption(float(architectureConfig.stemPathIndex), [float(v) for v in searchSpace.stemPathOptions]))
+
+    return ArchitectureConfig(
+        inputResolution=inputResolution,
+        outputStride=outputStride,
+        stageDepths=stageDepths,
+        stageWidthMultipliers=stageWidthMultipliers,
+        stemChannels=stemChannels,
+        stemPathIndex=stemPathIndex,
+        stagePathIndices=stagePathIndices,
+        stageKernelSizes=stageKernelSizes,
+        stageExtraStrides=stageExtraStrides,
+        enableAuxiliaryHeads=enableAuxiliaryHeads,
+    )
 
 
 def sampleRandomArchitecture(searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPACE) -> ArchitectureConfig:

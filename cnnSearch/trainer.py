@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import time
-from typing import Dict, List, Optional, Tuple, cast
+from typing import Dict, Iterable, List, Optional, Tuple, cast
 import json
 import random
 
@@ -14,7 +13,7 @@ import torch.nn.functional as F
 
 from cnnSearch.logging_utils import EventLogger, getEventLogger
 from cnnSearch.metrics import computeTopKAccuracy, reduceTensorAverage
-from cnnSearch.search_space import ArchitectureConfig, DEFAULT_SEARCH_SPACE, sampleRandomArchitecture
+from cnnSearch.search_space import ArchitectureConfig, DEFAULT_SEARCH_SPACE, SearchSpaceConfig, sampleRandomArchitecture
 
 LOGGER = getEventLogger(__name__)
 
@@ -51,8 +50,8 @@ def _extractLogitsAndAuxiliary(modelOutputs: object) -> Tuple[Tensor, List[Tenso
     return logits, []
 
 
-def _sampleBatchArchitecture(referenceResolution: int) -> ArchitectureConfig:
-    architecture = sampleRandomArchitecture(DEFAULT_SEARCH_SPACE)
+def _sampleBatchArchitecture(referenceResolution: int, searchSpace: SearchSpaceConfig) -> ArchitectureConfig:
+    architecture = sampleRandomArchitecture(searchSpace)
     return ArchitectureConfig(
         inputResolution=referenceResolution,
         outputStride=architecture.outputStride,
@@ -65,6 +64,82 @@ def _sampleBatchArchitecture(referenceResolution: int) -> ArchitectureConfig:
         stageExtraStrides=architecture.stageExtraStrides,
         enableAuxiliaryHeads=True,
     )
+
+
+def _iterBatchNormLikeModules(model: nn.Module) -> Iterable[nn.Module]:
+    for module in model.modules():
+        hasSlimStats = hasattr(module, "runningMean") and hasattr(module, "runningVar")
+        hasTorchStats = hasattr(module, "running_mean") and hasattr(module, "running_var")
+        if hasSlimStats or hasTorchStats:
+            yield module
+
+
+def _resetBatchNormLikeStats(module: nn.Module) -> None:
+    runningMean = getattr(module, "runningMean", None)
+    runningVar = getattr(module, "runningVar", None)
+    if torch.is_tensor(runningMean) and torch.is_tensor(runningVar):
+        runningMean.zero_()
+        runningVar.fill_(1.0)
+        return
+
+    runningMean = getattr(module, "running_mean", None)
+    runningVar = getattr(module, "running_var", None)
+    if torch.is_tensor(runningMean) and torch.is_tensor(runningVar):
+        runningMean.zero_()
+        runningVar.fill_(1.0)
+
+
+def recalibrateBatchNormStatistics(
+    model: nn.Module,
+    calibrationLoader: torch.utils.data.DataLoader,
+    device: torch.device,
+    architectureConfig: ArchitectureConfig,
+    ampEnabled: bool,
+    maxCalibrationSteps: int,
+    eventLogger: Optional[EventLogger] = None,
+) -> int:
+    if maxCalibrationSteps <= 0:
+        return 0
+
+    activeLogger = eventLogger if eventLogger is not None else LOGGER
+    bnLikeModules = list(_iterBatchNormLikeModules(model))
+    if not bnLikeModules:
+        return 0
+
+    for module in bnLikeModules:
+        _resetBatchNormLikeStats(module)
+
+    wasTraining = model.training
+    model.train()
+
+    numSteps = 0
+    with torch.no_grad():
+        for images, _ in calibrationLoader:
+            if numSteps >= maxCalibrationSteps:
+                break
+
+            images = images.to(device, non_blocking=True)
+            if images.shape[-1] != architectureConfig.inputResolution:
+                images = F.interpolate(
+                    images,
+                    size=(architectureConfig.inputResolution, architectureConfig.inputResolution),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            with autocast(enabled=ampEnabled and device.type == "cuda"):
+                model(images, architectureConfig)
+            numSteps += 1
+
+    if not wasTraining:
+        model.eval()
+
+    activeLogger.info(
+        "Recalibrated batchnorm statistics",
+        calibrationSteps=numSteps,
+        maxCalibrationSteps=maxCalibrationSteps,
+    )
+    return numSteps
 
 
 def _getGpuMemoryStatsMb(device: torch.device) -> Optional[Dict[str, float]]:
@@ -81,6 +156,26 @@ def _getGpuMemoryStatsMb(device: torch.device) -> Optional[Dict[str, float]]:
     }
 
 
+def shouldEvaluateOnEpoch(epochIndex: int, totalEpochs: int, evalEveryEpochs: int) -> bool:
+    if evalEveryEpochs <= 0:
+        raise ValueError(f"evalEveryEpochs must be > 0, got {evalEveryEpochs}")
+
+    epochNumber = epochIndex + 1
+    isPeriodicEvalEpoch = (epochNumber % evalEveryEpochs) == 0
+    isLastEpoch = epochNumber == totalEpochs
+    return isPeriodicEvalEpoch or isLastEpoch
+
+
+def shouldSaveCheckpointOnEpoch(epochIndex: int, saveEveryEpoch: int) -> bool:
+    if saveEveryEpoch < 0:
+        raise ValueError(f"saveEveryEpoch must be >= 0, got {saveEveryEpoch}")
+    if saveEveryEpoch == 0:
+        return False
+
+    epochNumber = epochIndex + 1
+    return (epochNumber % saveEveryEpoch) == 0
+
+
 def trainOneEpoch(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -94,6 +189,7 @@ def trainOneEpoch(
     referenceResolution: int,
     eventLogger: Optional[EventLogger] = None,
     logIntervalSteps: int = 5,
+    searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPACE,
 ) -> Dict[str, float]:
     model.train()
     activeLogger = eventLogger if eventLogger is not None else LOGGER
@@ -119,7 +215,7 @@ def trainOneEpoch(
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        sampledArchitecture = _sampleBatchArchitecture(referenceResolution=referenceResolution)
+        sampledArchitecture = _sampleBatchArchitecture(referenceResolution=referenceResolution, searchSpace=searchSpace)
         if images.shape[-1] != sampledArchitecture.inputResolution:
             images = F.interpolate(
                 images,
@@ -238,9 +334,23 @@ def evaluate(
     eventLogger: Optional[EventLogger] = None,
     logIntervalSteps: int = 100,
     epochIndex: Optional[int] = None,
+    bnCalibrationLoader: Optional[torch.utils.data.DataLoader] = None,
+    bnCalibrationSteps: int = 32,
 ) -> EvalResult:
-    model.eval()
     activeLogger = eventLogger if eventLogger is not None else LOGGER
+
+    if bnCalibrationLoader is not None and bnCalibrationSteps > 0:
+        recalibrateBatchNormStatistics(
+            model=model,
+            calibrationLoader=bnCalibrationLoader,
+            device=device,
+            architectureConfig=architectureConfig,
+            ampEnabled=ampEnabled,
+            maxCalibrationSteps=bnCalibrationSteps,
+            eventLogger=activeLogger,
+        )
+
+    model.eval()
 
     activeLogger.info(
         "Starting evaluation",

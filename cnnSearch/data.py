@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, DistributedSampler, Subset, random_split
@@ -22,6 +22,34 @@ class DataLoaderBundle:
     trainSampler: Optional[DistributedSampler]
     valSampler: Optional[DistributedSampler]
     numClasses: int
+
+
+class _ClassIndexRemapper:
+    """Remap validation class indices into the training class index space."""
+
+    def __init__(self, remapByValIndex: List[int]) -> None:
+        self.remapByValIndex = remapByValIndex
+
+    def __call__(self, target: int) -> int:
+        return self.remapByValIndex[target]
+
+
+def _buildValTargetRemapper(
+    trainClassToIndex: Dict[str, int],
+    valClassToIndex: Dict[str, int],
+) -> _ClassIndexRemapper:
+    missingClasses = [className for className in valClassToIndex.keys() if className not in trainClassToIndex]
+    if missingClasses:
+        raise ValueError(
+            "Validation dataset contains classes missing in training dataset: "
+            + ", ".join(sorted(missingClasses))
+        )
+
+    maxValIndex = max(valClassToIndex.values()) if valClassToIndex else -1
+    remapByValIndex = [0 for _ in range(maxValIndex + 1)]
+    for className, valIndex in valClassToIndex.items():
+        remapByValIndex[valIndex] = trainClassToIndex[className]
+    return _ClassIndexRemapper(remapByValIndex)
 
 
 def _buildAutoValidationSplit(
@@ -88,11 +116,15 @@ def buildImageFolderLoaders(
             raise FileNotFoundError(f"Validation directory does not exist: {valDir}")
 
         valDataset = ImageFolder(root=str(valPath), transform=buildEvalTransform(imageSize))
+        remapper = _buildValTargetRemapper(trainDatasetFull.class_to_idx, valDataset.class_to_idx)
+        valDataset.target_transform = remapper
         trainDataset = trainDatasetFull
         activeLogger.info(
             "Using explicit validation directory",
             valDir=str(valPath),
             valSamples=len(valDataset),
+            trainClasses=len(trainDatasetFull.classes),
+            valClasses=len(valDataset.classes),
         )
     else:
         trainSubset, valSubset = _buildAutoValidationSplit(trainDatasetFull, valSplitRatio=valSplitRatio, splitSeed=splitSeed)

@@ -18,8 +18,16 @@ from cnnSearch.data import buildImageFolderLoaders
 from cnnSearch.distributed import cleanupDistributed, getRank, isMainProcess, setupDistributed
 from cnnSearch.logging_utils import LoggingConfig, configureLogging, getEventLogger
 from cnnSearch.models.supernet import ResNetSuperNet
-from cnnSearch.search_space import ArchitectureConfig, DEFAULT_SEARCH_SPACE
-from cnnSearch.trainer import TrainConfig, appendJsonLog, evaluate, saveCheckpoint, trainOneEpoch
+from cnnSearch.search_space import ArchitectureConfig, DEFAULT_SEARCH_SPACE, SearchSpaceConfig
+from cnnSearch.trainer import (
+    TrainConfig,
+    appendJsonLog,
+    evaluate,
+    saveCheckpoint,
+    shouldEvaluateOnEpoch,
+    shouldSaveCheckpointOnEpoch,
+    trainOneEpoch,
+)
 
 NUM_GPUS = 1
 
@@ -59,9 +67,10 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--enable-complex-paths", action="store_true", help="Enable complex SE and dilated paths (paths 3 and 4) which are disabled by default")
 
     parser.add_argument("--saveDir", type=str, default="./checkpoints")
-    parser.add_argument("--evalEveryEpochs", type=int, default=10)
+    parser.add_argument("--evalEveryEpochs", type=int, default=1, help="Run validation every N epochs (1-based). Validation is always run on the final epoch.")
+    parser.add_argument("--save-every-epoch", type=int, default=0, help="Save periodic checkpoints every N epochs (1-based). Set 0 to disable periodic checkpoints.")
     parser.add_argument("--valSplitRatio", type=float, default=0.15)
-    parser.add_argument("--disableCheckpointing", action="store_true", help="Skip writing checkpoints and best model files")
+    parser.add_argument("--disableCheckpointing", action="store_true", help="Skip writing periodic checkpoints. Best model is still saved on validation improvement.")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None)
@@ -69,21 +78,29 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--logFormat", type=str, default="text", choices=["text", "json"])
     parser.add_argument("--logFile", type=str, default=None)
     parser.add_argument("--logIntervalSteps", type=int, default=50)
+    parser.add_argument("--bnCalibrationSteps", type=int, default=32, help="Train batches used to recalibrate BatchNorm stats before each validation run; set to 0 to disable")
 
     return parser.parse_args()
 
 
-def _buildEvaluationArchitecture(imageSize: int) -> ArchitectureConfig:
+def _buildEvaluationArchitecture(imageSize: int, searchSpace: SearchSpaceConfig) -> ArchitectureConfig:
+    def _preferredPathIndex(pathOptions: list[int]) -> int:
+        if 1 in pathOptions:
+            return 1
+        return pathOptions[0]
+
+    stemPathIndex = 1 if 1 in searchSpace.stemPathOptions else searchSpace.stemPathOptions[0]
+
     return ArchitectureConfig(
         inputResolution=imageSize,
         outputStride=16,
-        stageDepths=[max(options) for options in DEFAULT_SEARCH_SPACE.depthOptionsPerStage],
-        stageWidthMultipliers=[max(options) for options in DEFAULT_SEARCH_SPACE.widthMultipliersPerStage],
-        stemChannels=max(DEFAULT_SEARCH_SPACE.stemChannels),
-        stemPathIndex=1,
-        stagePathIndices=[1, 1, 1, 1],
-        stageKernelSizes=[3, 3, 3, 3],
-        stageExtraStrides=[1, 1, 1, 1],
+        stageDepths=[max(options) for options in searchSpace.depthOptionsPerStage],
+        stageWidthMultipliers=[max(options) for options in searchSpace.widthMultipliersPerStage],
+        stemChannels=max(searchSpace.stemChannels),
+        stemPathIndex=stemPathIndex,
+        stagePathIndices=[_preferredPathIndex(options) for options in searchSpace.stagePathOptionsPerStage],
+        stageKernelSizes=[3 if 3 in options else max(options) for options in searchSpace.stageKernelSizeOptionsPerStage],
+        stageExtraStrides=[1 if 1 in options else min(options) for options in searchSpace.stageExtraStrideOptionsPerStage],
         enableAuxiliaryHeads=False,
     )
 
@@ -117,7 +134,11 @@ def main() -> None:
         logLevel=args.logLevel,
         logFormat=args.logFormat,
         logFile=args.logFile,
+        saveEveryEpoch=args.save_every_epoch,
     )
+
+    if args.save_every_epoch < 0:
+        raise ValueError(f"--save-every-epoch must be >= 0, got {args.save_every_epoch}")
 
     Path(args.saveDir).mkdir(parents=True, exist_ok=True)
 
@@ -213,7 +234,7 @@ def main() -> None:
         evalEveryEpochs=args.evalEveryEpochs,
     )
 
-    evalArchitecture = _buildEvaluationArchitecture(args.imageSize)
+    evalArchitecture = _buildEvaluationArchitecture(args.imageSize, searchSpace)
 
     for epochIndex in range(startEpoch, trainConfig.epochs):
         LOGGER.info("Epoch started", epoch=epochIndex)
@@ -233,6 +254,7 @@ def main() -> None:
             referenceResolution=args.imageSize,
             eventLogger=LOGGER,
             logIntervalSteps=args.logIntervalSteps,
+            searchSpace=searchSpace,
         )
 
         scheduler.step()
@@ -253,7 +275,7 @@ def main() -> None:
             print(f"TRAIN Top-1 Acc:    {trainMetrics['top1']:.2f}%")
             print(f"TRAIN Top-5 Acc:    {trainMetrics['top5']:.2f}%")
 
-        if epochIndex % trainConfig.evalEveryEpochs == 0:
+        if shouldEvaluateOnEpoch(epochIndex=epochIndex, totalEpochs=trainConfig.epochs, evalEveryEpochs=trainConfig.evalEveryEpochs):
             evalMetrics = evaluate(
                 model=model,
                 valLoader=dataBundle.valLoader,
@@ -263,6 +285,8 @@ def main() -> None:
                 eventLogger=LOGGER,
                 logIntervalSteps=max(1, args.logIntervalSteps * 2),
                 epochIndex=epochIndex,
+                bnCalibrationLoader=dataBundle.trainLoader,
+                bnCalibrationSteps=args.bnCalibrationSteps,
             )
             metricsForLog.update(
                 {
@@ -279,7 +303,7 @@ def main() -> None:
 
             if evalMetrics.top1 > bestTop1:
                 bestTop1 = evalMetrics.top1
-                if isMainProcess() and not args.disableCheckpointing:
+                if isMainProcess():
                     bestPath = Path(trainConfig.saveDir) / "best_model.pth"
                     try:
                         torch.save(
@@ -296,7 +320,11 @@ def main() -> None:
 
         if isMainProcess():
             appendJsonLog(trainConfig.saveDir, metricsForLog)
-            if not args.disableCheckpointing:
+            shouldSavePeriodicCheckpoint = shouldSaveCheckpointOnEpoch(
+                epochIndex=epochIndex,
+                saveEveryEpoch=args.save_every_epoch,
+            )
+            if not args.disableCheckpointing and shouldSavePeriodicCheckpoint:
                 saveCheckpoint(
                     saveDir=trainConfig.saveDir,
                     epochIndex=epochIndex,
