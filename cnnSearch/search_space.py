@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import itertools
+import json
 import math
 import random
 from typing import Dict, List
@@ -358,3 +359,210 @@ def iterateAllArchitectures(searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPAC
                 stageExtraStrides=stageExtraStrides,
                 enableAuxiliaryHeads=True,
             )
+
+
+def architectureDistance(
+    firstArchitecture: ArchitectureConfig,
+    secondArchitecture: ArchitectureConfig,
+    searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPACE,
+) -> float:
+    """Compute a normalized architecture distance in [0, 1] using per-field option ranges."""
+    firstConfig = normalizeArchitectureForSearchSpace(firstArchitecture, searchSpace=searchSpace, enableAuxiliaryHeads=False)
+    secondConfig = normalizeArchitectureForSearchSpace(secondArchitecture, searchSpace=searchSpace, enableAuxiliaryHeads=False)
+
+    optionRanges: List[int] = []
+    absoluteDiffs: List[float] = []
+
+    optionRanges.extend([
+        max(1, len(searchSpace.inputResolutions) - 1),
+        max(1, len(searchSpace.outputStrides) - 1),
+        max(1, len(searchSpace.stemChannels) - 1),
+        max(1, len(searchSpace.stemPathOptions) - 1),
+    ])
+    absoluteDiffs.extend([
+        abs(searchSpace.inputResolutions.index(firstConfig.inputResolution) - searchSpace.inputResolutions.index(secondConfig.inputResolution)),
+        abs(searchSpace.outputStrides.index(firstConfig.outputStride) - searchSpace.outputStrides.index(secondConfig.outputStride)),
+        abs(searchSpace.stemChannels.index(firstConfig.stemChannels) - searchSpace.stemChannels.index(secondConfig.stemChannels)),
+        abs(searchSpace.stemPathOptions.index(firstConfig.stemPathIndex) - searchSpace.stemPathOptions.index(secondConfig.stemPathIndex)),
+    ])
+
+    for stageIndex in range(len(searchSpace.baseChannelsPerStage)):
+        depthOptions = searchSpace.depthOptionsPerStage[stageIndex]
+        widthOptions = searchSpace.widthMultipliersPerStage[stageIndex]
+        pathOptions = searchSpace.stagePathOptionsPerStage[stageIndex]
+        kernelOptions = searchSpace.stageKernelSizeOptionsPerStage[stageIndex]
+        strideOptions = searchSpace.stageExtraStrideOptionsPerStage[stageIndex]
+
+        optionRanges.extend([
+            max(1, len(depthOptions) - 1),
+            max(1, len(widthOptions) - 1),
+            max(1, len(pathOptions) - 1),
+            max(1, len(kernelOptions) - 1),
+            max(1, len(strideOptions) - 1),
+        ])
+        absoluteDiffs.extend([
+            abs(depthOptions.index(firstConfig.stageDepths[stageIndex]) - depthOptions.index(secondConfig.stageDepths[stageIndex])),
+            abs(widthOptions.index(firstConfig.stageWidthMultipliers[stageIndex]) - widthOptions.index(secondConfig.stageWidthMultipliers[stageIndex])),
+            abs(pathOptions.index(firstConfig.stagePathIndices[stageIndex]) - pathOptions.index(secondConfig.stagePathIndices[stageIndex])),
+            abs(kernelOptions.index(firstConfig.stageKernelSizes[stageIndex]) - kernelOptions.index(secondConfig.stageKernelSizes[stageIndex])),
+            abs(strideOptions.index(firstConfig.stageExtraStrides[stageIndex]) - strideOptions.index(secondConfig.stageExtraStrides[stageIndex])),
+        ])
+
+    normalizedDistance = sum(diff / optionRange for diff, optionRange in zip(absoluteDiffs, optionRanges)) / float(len(optionRanges))
+    return max(0.0, min(1.0, normalizedDistance))
+
+
+def architectureSimilarityScore(
+    firstArchitecture: ArchitectureConfig,
+    secondArchitecture: ArchitectureConfig,
+    searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPACE,
+) -> float:
+    """Compute a normalized architecture similarity in [0, 1]."""
+    return 1.0 - architectureDistance(firstArchitecture, secondArchitecture, searchSpace=searchSpace)
+
+
+def generateSimilarArchitectures(
+    seedArchitecture: ArchitectureConfig,
+    searchSpace: SearchSpaceConfig = DEFAULT_SEARCH_SPACE,
+    maxCandidates: int = 16,
+    maxMutations: int = 2,
+) -> List[ArchitectureConfig]:
+    """Generate nearby architecture variants by mutating a few categorical choices around a seed."""
+    normalizedSeed = normalizeArchitectureForSearchSpace(seedArchitecture, searchSpace=searchSpace, enableAuxiliaryHeads=False)
+    generatedArchitectures: List[ArchitectureConfig] = []
+    seenConfigs = {json.dumps(normalizedSeed.toDict(), sort_keys=True)}
+
+    mutationFields = [
+        "inputResolution",
+        "outputStride",
+        "stemChannels",
+        "stemPathIndex",
+        "stageDepths",
+        "stageWidthMultipliers",
+        "stagePathIndices",
+        "stageKernelSizes",
+        "stageExtraStrides",
+    ]
+
+    maxAttempts = maxCandidates * 12
+    attemptIndex = 0
+    while len(generatedArchitectures) < maxCandidates and attemptIndex < maxAttempts:
+        attemptIndex += 1
+        mutatedConfig = ArchitectureConfig(
+            inputResolution=normalizedSeed.inputResolution,
+            outputStride=normalizedSeed.outputStride,
+            stageDepths=list(normalizedSeed.stageDepths),
+            stageWidthMultipliers=list(normalizedSeed.stageWidthMultipliers),
+            stemChannels=normalizedSeed.stemChannels,
+            stemPathIndex=normalizedSeed.stemPathIndex,
+            stagePathIndices=list(normalizedSeed.stagePathIndices),
+            stageKernelSizes=list(normalizedSeed.stageKernelSizes),
+            stageExtraStrides=list(normalizedSeed.stageExtraStrides),
+            enableAuxiliaryHeads=False,
+        )
+
+        numMutations = random.randint(1, max(1, maxMutations))
+        for _ in range(numMutations):
+            fieldName = random.choice(mutationFields)
+            if fieldName == "inputResolution":
+                mutatedConfig = ArchitectureConfig(
+                    **{
+                        **mutatedConfig.toDict(),
+                        "inputResolution": random.choice(searchSpace.inputResolutions),
+                        "enableAuxiliaryHeads": False,
+                    }
+                )
+                continue
+            if fieldName == "outputStride":
+                mutatedConfig = ArchitectureConfig(
+                    **{
+                        **mutatedConfig.toDict(),
+                        "outputStride": random.choice(searchSpace.outputStrides),
+                        "enableAuxiliaryHeads": False,
+                    }
+                )
+                continue
+            if fieldName == "stemChannels":
+                mutatedConfig = ArchitectureConfig(
+                    **{
+                        **mutatedConfig.toDict(),
+                        "stemChannels": random.choice(searchSpace.stemChannels),
+                        "enableAuxiliaryHeads": False,
+                    }
+                )
+                continue
+            if fieldName == "stemPathIndex":
+                mutatedConfig = ArchitectureConfig(
+                    **{
+                        **mutatedConfig.toDict(),
+                        "stemPathIndex": random.choice(searchSpace.stemPathOptions),
+                        "enableAuxiliaryHeads": False,
+                    }
+                )
+                continue
+
+            stageIndex = random.randint(0, len(searchSpace.baseChannelsPerStage) - 1)
+            if fieldName == "stageDepths":
+                nextValues = list(mutatedConfig.stageDepths)
+                nextValues[stageIndex] = random.choice(searchSpace.depthOptionsPerStage[stageIndex])
+                mutatedConfig = ArchitectureConfig(
+                    **{
+                        **mutatedConfig.toDict(),
+                        "stageDepths": nextValues,
+                        "enableAuxiliaryHeads": False,
+                    }
+                )
+                continue
+            if fieldName == "stageWidthMultipliers":
+                nextValues = list(mutatedConfig.stageWidthMultipliers)
+                nextValues[stageIndex] = random.choice(searchSpace.widthMultipliersPerStage[stageIndex])
+                mutatedConfig = ArchitectureConfig(
+                    **{
+                        **mutatedConfig.toDict(),
+                        "stageWidthMultipliers": nextValues,
+                        "enableAuxiliaryHeads": False,
+                    }
+                )
+                continue
+            if fieldName == "stagePathIndices":
+                nextValues = list(mutatedConfig.stagePathIndices)
+                nextValues[stageIndex] = random.choice(searchSpace.stagePathOptionsPerStage[stageIndex])
+                mutatedConfig = ArchitectureConfig(
+                    **{
+                        **mutatedConfig.toDict(),
+                        "stagePathIndices": nextValues,
+                        "enableAuxiliaryHeads": False,
+                    }
+                )
+                continue
+            if fieldName == "stageKernelSizes":
+                nextValues = list(mutatedConfig.stageKernelSizes)
+                nextValues[stageIndex] = random.choice(searchSpace.stageKernelSizeOptionsPerStage[stageIndex])
+                mutatedConfig = ArchitectureConfig(
+                    **{
+                        **mutatedConfig.toDict(),
+                        "stageKernelSizes": nextValues,
+                        "enableAuxiliaryHeads": False,
+                    }
+                )
+                continue
+            if fieldName == "stageExtraStrides":
+                nextValues = list(mutatedConfig.stageExtraStrides)
+                nextValues[stageIndex] = random.choice(searchSpace.stageExtraStrideOptionsPerStage[stageIndex])
+                mutatedConfig = ArchitectureConfig(
+                    **{
+                        **mutatedConfig.toDict(),
+                        "stageExtraStrides": nextValues,
+                        "enableAuxiliaryHeads": False,
+                    }
+                )
+
+        normalizedMutated = normalizeArchitectureForSearchSpace(mutatedConfig, searchSpace=searchSpace, enableAuxiliaryHeads=False)
+        configKey = json.dumps(normalizedMutated.toDict(), sort_keys=True)
+        if configKey in seenConfigs:
+            continue
+
+        seenConfigs.add(configKey)
+        generatedArchitectures.append(normalizedMutated)
+
+    return generatedArchitectures

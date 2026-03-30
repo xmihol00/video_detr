@@ -139,6 +139,24 @@ The project has several planned improvements:
 - Deployment utilities for edge devices
 - Performance optimizations for real-time inference
 
+## IMX500 Compilation Envelope Search (cnnSearch)
+
+The repository includes `cnnSearch/search_compilable_subnets.py`, a resumable utility that searches for subnet architectures that can be quantized and compiled to Sony IMX500.
+
+At a high level, it:
+- populates a candidate architecture DB (random sampling or exhaustive enumeration),
+- runs binary searches for smallest/largest compilable subnet by parameter-memory proxy,
+- densifies checks around boundaries,
+- generates similarity-guided nearby architectures,
+- validates a threshold-focused subset near the upper compilable boundary,
+- writes both a full DB and a verified/likely summary JSON.
+
+The script now supports `--dv`:
+- pass a DB JSON file to continue an existing run,
+- leave it empty to create a new `compilation_search_<YYYYMMDD_HHMMSS>.json` file.
+
+For full operational details and command examples, see `cnnSearch/README.md`.
+
 ## Key Concepts Explained Simply
 
 **Transformer** — A type of neural network that can look at all parts of the input simultaneously and understand relationships between distant parts. Originally developed for language, it's now widely used for vision tasks.

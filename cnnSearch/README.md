@@ -115,6 +115,110 @@ cd /home/david/projs/video_detr
   --logFormat text \
   --amp \
   --outputJson cnnSearch/outputs/candidate_eval.json
+```
+
+## IMX500 compilable-subnet search
+
+The script `cnnSearch/search_compilable_subnets.py` is a resumable architecture search utility focused on a practical question: **which subnet configurations can be quantized and compiled for Sony IMX500**.
+
+### How the search works end-to-end
+
+1. **Candidate population**
+   - Reads/creates a DB JSON file with candidate architectures.
+   - In exhaustive mode (`--num-samples` not provided), iterates the full Cartesian product from `search_space.py`.
+   - In sampling mode, adds random unique candidates until the target count is reached.
+   - Every sampled candidate is normalized to static legal search-space options via `normalizeArchitectureForSearchSpace(...)`.
+   - Each candidate stores:
+     - architecture config,
+     - `param_count` (PyTorch parameter count),
+     - status (`PENDING|SUCCESS|FAILED`),
+     - error message if compilation fails.
+
+2. **Compilation check for one candidate**
+   - Materializes subnet from supernet weights.
+   - Quantizes to ONNX with `RepresentativeDataGenerator` and `Imx500Exporter`.
+   - Runs `imxconv-pt` compiler.
+   - Stores pass/fail in DB and keeps the process resumable.
+
+3. **Two boundary binary searches**
+   - Sorts candidates by `param_count`.
+   - Runs binary search for:
+     - the **largest** compilable architecture,
+     - the **smallest** compilable architecture.
+   - This gives an initial compilable-memory envelope in terms of parameter memory (FP32 proxy).
+
+4. **Dense refinement around boundaries**
+   - Runs extra checks in dense windows around both boundary indices.
+   - Reduces error from sparse sampling and sharpens the envelope.
+
+5. **Similarity-guided expansion**
+   - Uses verified compilable architectures as seeds.
+   - Generates nearby configs with `generateSimilarArchitectures(...)` from `search_space.py` (few controlled mutations per seed).
+   - Scores each candidate using:
+     - architecture similarity (`architectureSimilarityScore(...)`),
+     - memory proximity to upper compilable threshold.
+   - Keeps only candidates inside the current compilable memory envelope.
+
+6. **Threshold-focused validation of likely candidates**
+   - Adds likely candidates to the main DB (`source: "SIMILARITY"`).
+   - Compiles a budgeted subset near the upper threshold band to tighten the practical max-size boundary.
+
+7. **Writes two output JSON artifacts**
+   - **Main DB**: full history of sampled and similarity-generated candidates with statuses.
+   - **Verified/Likely summary DB**: compact summary containing:
+     - compilable envelope,
+     - all verified compilable architectures,
+     - similarity-generated likely-compilable candidates (including predicted scores and any verified outcomes).
+
+### `--dv`: choose DB file or start a timestamped run
+
+- `--dv <path>`: continue search from the given JSON DB.
+- `--dv ""` (default): create a new DB named
+  - `compilation_search_<YYYYMMDD_HHMMSS>.json`.
+
+For each DB file, a companion summary file is produced:
+- `<db_stem>_verified_candidates.json`
+
+### Search-space role (`search_space.py`)
+
+`cnnSearch/search_space.py` defines both the searchable dimensions and the utilities used by this script:
+
+- `SearchSpaceConfig`: valid option sets for resolution, strides, depths, widths, paths, kernels, and extra strides.
+- `ArchitectureConfig`: concrete architecture instance schema.
+- `normalizeArchitectureForSearchSpace(...)`: clamps architecture values to nearest valid static options.
+- `sampleRandomArchitecture(...)`: random architecture generator.
+- `iterateAllArchitectures(...)`: exhaustive architecture iterator.
+- `architectureDistance(...)`: normalized distance over all architecture choices.
+- `architectureSimilarityScore(...)`: similarity value in `[0, 1]`.
+- `generateSimilarArchitectures(...)`: local mutation generator for neighborhood exploration.
+
+### Example commands
+
+Start a new timestamped DB run:
+
+```bash
+cd /home/david/projs/video_detr
+/home/david/projs/video_detr/.venv/bin/python -m cnnSearch.search_compilable_subnets \
+  --num-samples 2000
+```
+
+Resume from an existing DB:
+
+```bash
+cd /home/david/projs/video_detr
+/home/david/projs/video_detr/.venv/bin/python -m cnnSearch.search_compilable_subnets \
+  --num-samples 2000 \
+  --dv cnnSearch/outputs/compilation_search_20260330_173000.json
+```
+
+Enable complex stage paths during search:
+
+```bash
+cd /home/david/projs/video_detr
+/home/david/projs/video_detr/.venv/bin/python -m cnnSearch.search_compilable_subnets \
+  --num-samples 2000 \
+  --enable-complex-paths
+```
 
 ## Logging configuration
 

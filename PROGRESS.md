@@ -1,5 +1,32 @@
 # PROGRESS
 
+## 2026-03-30
+
+- Improved IMX500 compilation search flow in `cnnSearch/search_compilable_subnets.py`:
+  - added `--dv` argument to select/continue a DB file,
+  - when `--dv` is empty, the script now creates a timestamped DB file: `compilation_search_<YYYYMMDD_HHMMSS>.json`,
+  - added companion summary output file `<db_stem>_verified_candidates.json`.
+- Reworked search strategy to better estimate compilable architecture envelope:
+  - binary search for largest compilable architecture,
+  - binary search for smallest compilable architecture,
+  - dense checks around both boundaries,
+  - explicit envelope summary using parameter-memory proxy (bytes/MiB from parameter count).
+- Added similarity-guided exploration to improve sparse sampling:
+  - generated near-neighbor candidates around verified compilable seeds,
+  - scored candidates using architecture similarity + memory proximity,
+  - injected likely candidates into DB with `source="SIMILARITY"`,
+  - added threshold-focused compilation checks near upper boundary to refine practical limit.
+- Extended `cnnSearch/search_space.py` with new utilities:
+  - `architectureDistance(...)`,
+  - `architectureSimilarityScore(...)`,
+  - `generateSimilarArchitectures(...)`.
+- Added tests in `tests/test_search_space_similarity.py` for similarity helpers and mutation generation.
+- Updated documentation:
+  - added full IMX500 compilable-search workflow description and usage examples to `cnnSearch/README.md`,
+  - added top-level project note in `README.md` linking to the detailed cnnSearch search docs.
+- Validation run:
+  - `pytest -q tests/test_search_space_similarity.py tests/test_search_space_normalization.py` → `4 passed`.
+
 ## 2026-03-23
 
 - Fixed a validation-label indexing bug in `cnnSearch/data.py` for explicit `valDir` usage:
