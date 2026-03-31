@@ -26,6 +26,12 @@
   - added top-level project note in `README.md` linking to the detailed cnnSearch search docs.
 - Validation run:
   - `pytest -q tests/test_search_space_similarity.py tests/test_search_space_normalization.py` → `4 passed`.
+- Added SGE-friendly GPU assignment handling in `cnnSearch/search_compilable_subnets.py`:
+  - integrated `safe_gpu.claim_gpus(...)` loop with wait/retry behavior,
+  - captures effective `CUDA_VISIBLE_DEVICES` after claim,
+  - propagates the claimed GPU visibility explicitly into `imxconv-pt` subprocess environment (`CUDA_VISIBLE_DEVICES` + `NVIDIA_VISIBLE_DEVICES`),
+  - added `--num-gpus` CLI option to control claimed GPU count.
+- Updated `cnnSearch/README.md` with GPU assignment behavior notes and command examples including `--num-gpus`.
 
 ## 2026-03-23
 

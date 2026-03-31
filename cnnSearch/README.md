@@ -137,6 +137,7 @@ The script `cnnSearch/search_compilable_subnets.py` is a resumable architecture 
 2. **Compilation check for one candidate**
    - Materializes subnet from supernet weights.
    - Quantizes to ONNX with `RepresentativeDataGenerator` and `Imx500Exporter`.
+  - Claims GPU(s) with `safe_gpu` before search/compilation and reuses assigned `CUDA_VISIBLE_DEVICES`.
    - Runs `imxconv-pt` compiler.
    - Stores pass/fail in DB and keeps the process resumable.
 
@@ -199,7 +200,8 @@ Start a new timestamped DB run:
 ```bash
 cd /home/david/projs/video_detr
 /home/david/projs/video_detr/.venv/bin/python -m cnnSearch.search_compilable_subnets \
-  --num-samples 2000
+  --num-samples 2000 \
+  --num-gpus 1
 ```
 
 Resume from an existing DB:
@@ -208,7 +210,8 @@ Resume from an existing DB:
 cd /home/david/projs/video_detr
 /home/david/projs/video_detr/.venv/bin/python -m cnnSearch.search_compilable_subnets \
   --num-samples 2000 \
-  --dv cnnSearch/outputs/compilation_search_20260330_173000.json
+  --dv cnnSearch/outputs/compilation_search_20260330_173000.json \
+  --num-gpus 1
 ```
 
 Enable complex stage paths during search:
@@ -217,8 +220,16 @@ Enable complex stage paths during search:
 cd /home/david/projs/video_detr
 /home/david/projs/video_detr/.venv/bin/python -m cnnSearch.search_compilable_subnets \
   --num-samples 2000 \
-  --enable-complex-paths
+  --enable-complex-paths \
+  --num-gpus 1
 ```
+
+### GPU assignment behavior (SGE + `safe_gpu`)
+
+- `search_compilable_subnets.py` claims GPUs with `safe_gpu.claim_gpus(...)` before executing the search.
+- The active `CUDA_VISIBLE_DEVICES` after claim is captured and forced into `imxconv-pt` subprocess environment.
+- This keeps compiler execution constrained to the same GPU visibility assigned by scheduler + `safe_gpu`.
+- If `safe_gpu` cannot be imported, the script continues and logs a warning.
 
 ## Logging configuration
 

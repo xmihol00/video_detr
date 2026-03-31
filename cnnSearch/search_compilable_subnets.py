@@ -4,6 +4,7 @@ import json
 import os
 import torch
 import sys
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import traceback
 import subprocess
@@ -38,6 +39,7 @@ SIMILARITY_PER_SEED = 24
 SIMILARITY_MAX_MUTATIONS = 2
 THRESHOLD_BAND_RATIO = 0.15
 PARAM_BYTES_FP32 = 4
+GPU_VISIBILITY_OVERRIDE: Optional[str] = None
 
 
 def logEvent(eventType, message):
@@ -67,6 +69,53 @@ def get_param_memory_bytes(paramCount: int) -> int:
 
 def get_param_memory_mib(paramCount: int) -> float:
     return float(get_param_memory_bytes(paramCount)) / float(1024 * 1024)
+
+
+def claimSchedulerAssignedGpus(numGpus: int = 1, retrySleepSeconds: int = 5) -> Optional[str]:
+    """Claim GPUs via safe_gpu and return active CUDA visibility string if available."""
+    if numGpus <= 0:
+        return os.environ.get("CUDA_VISIBLE_DEVICES")
+
+    try:
+        import safe_gpu
+    except Exception as importError:
+        logEvent("WARN", f"safe_gpu import failed ({importError}). Proceeding without explicit GPU claim")
+        return os.environ.get("CUDA_VISIBLE_DEVICES")
+
+    schedulerVisibleGpus = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if schedulerVisibleGpus:
+        logEvent("INFO", f"Scheduler exposed CUDA_VISIBLE_DEVICES={schedulerVisibleGpus}")
+
+    while True:
+        try:
+            safe_gpu.claim_gpus(numGpus)
+            break
+        except Exception:
+            logEvent("WARN", "Waiting for free GPU via safe_gpu")
+            time.sleep(retrySleepSeconds)
+
+    claimedVisibleGpus = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if claimedVisibleGpus:
+        logEvent("INFO", f"safe_gpu active CUDA_VISIBLE_DEVICES={claimedVisibleGpus}")
+        return claimedVisibleGpus
+
+    if torch.cuda.is_available():
+        currentDevice = torch.cuda.current_device()
+        fallbackVisible = str(currentDevice)
+        os.environ["CUDA_VISIBLE_DEVICES"] = fallbackVisible
+        logEvent("WARN", f"safe_gpu did not set CUDA visibility; using torch current device {fallbackVisible}")
+        return fallbackVisible
+
+    logEvent("WARN", "CUDA not available after safe_gpu claim")
+    return os.environ.get("CUDA_VISIBLE_DEVICES")
+
+
+def getCompilerEnvironment() -> Dict[str, str]:
+    compilerEnvironment = dict(os.environ)
+    if GPU_VISIBILITY_OVERRIDE is not None and GPU_VISIBILITY_OVERRIDE.strip() != "":
+        compilerEnvironment["CUDA_VISIBLE_DEVICES"] = GPU_VISIBILITY_OVERRIDE
+        compilerEnvironment["NVIDIA_VISIBLE_DEVICES"] = GPU_VISIBILITY_OVERRIDE
+    return compilerEnvironment
 
 def get_config_hash(config_dict):
     """Create a unique hash/string for a config dictionary to check for duplicates."""
@@ -277,7 +326,8 @@ def attempt_compilation(config_data, experiment_id):
             cmd, 
             stdout=subprocess.PIPE, 
             stderr=subprocess.PIPE, 
-            text=True
+            text=True,
+            env=getCompilerEnvironment(),
         )
         
         if result.returncode != 0:
@@ -686,11 +736,19 @@ def main():
     parser.add_argument("--num-samples", type=int, default=None, help="Number of random samples to generate. If not set, exhaustive search is performed.")
     parser.add_argument("--enable-complex-paths", action="store_true", help="Enable complex SE and dilated paths (paths 3 and 4) which are disabled by default")
     parser.add_argument("--dv", type=str, default="", help="Database file path to continue from. Leave empty to create compilation_search_<datetime>.json")
+    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs to claim with safe_gpu before compilation checks")
     args = parser.parse_args()
     
     global SEARCH_SPACE
+    global GPU_VISIBILITY_OVERRIDE
     from cnnSearch.search_space import getSearchSpace
     SEARCH_SPACE = getSearchSpace(useComplexPaths=args.enable_complex_paths)
+
+    GPU_VISIBILITY_OVERRIDE = claimSchedulerAssignedGpus(numGpus=args.num_gpus)
+    if GPU_VISIBILITY_OVERRIDE is not None and GPU_VISIBILITY_OVERRIDE.strip() != "":
+        logEvent("INFO", f"Compilation subprocesses constrained to CUDA_VISIBLE_DEVICES={GPU_VISIBILITY_OVERRIDE}")
+    else:
+        logEvent("WARN", "No CUDA visibility override detected for compilation subprocesses")
     
     if args.enable_complex_paths:
         logEvent("INFO", "Enabling complex SE and dilated paths (paths 3 and 4)")
