@@ -224,12 +224,65 @@ cd /home/david/projs/video_detr
   --num-gpus 1
 ```
 
+Run search with trained supernet weights and evaluate only compilable candidates:
+
+```bash
+cd /home/david/projs/video_detr
+/home/david/projs/video_detr/.venv/bin/python -m cnnSearch.search_compilable_subnets \
+  --num-samples 2000 \
+  --supernet-checkpoint cnnSearch/best_model.pth \
+  --eval-dataset /home/david/Downloads/subset \
+  --eval-batch-size 32 \
+  --eval-num-workers 4 \
+  --num-gpus 1
+```
+
 ### GPU assignment behavior (SGE + `safe_gpu`)
 
 - `search_compilable_subnets.py` claims GPUs with `safe_gpu.claim_gpus(...)` before executing the search.
 - The active `CUDA_VISIBLE_DEVICES` after claim is captured and forced into `imxconv-pt` subprocess environment.
 - This keeps compiler execution constrained to the same GPU visibility assigned by scheduler + `safe_gpu`.
 - If `safe_gpu` cannot be imported, the script continues and logs a warning.
+
+## Standalone evaluation engine
+
+`cnnSearch/engine.py` provides a standalone quantize/compile/evaluate runner for search outputs.
+
+### 1) Evaluate a pre-quantized ONNX model
+
+```bash
+cd /home/david/projs/video_detr
+/home/david/projs/video_detr/.venv/bin/python -m cnnSearch.engine \
+  --dataset-path /home/david/Downloads/subset \
+  --quantized-onnx-path quantized_model.onnx \
+  --batch-size 32 \
+  --num-workers 4
+```
+
+### 2) Evaluate all architectures from a verified-candidates JSON
+
+```bash
+cd /home/david/projs/video_detr
+/home/david/projs/video_detr/.venv/bin/python -m cnnSearch.engine \
+  --dataset-path /home/david/Downloads/subset \
+  --supernet-path cnnSearch/best_model.pth \
+  --compilation-json examples/compilation_search_20260330_174625_verified_candidates.json \
+  --batch-size 32 \
+  --num-workers 4 \
+  --output-json cnnSearch/outputs/engine_eval_results.json
+```
+
+### 3) Evaluate one architecture JSON from supernet
+
+```bash
+cd /home/david/projs/video_detr
+/home/david/projs/video_detr/.venv/bin/python -m cnnSearch.engine \
+  --dataset-path /home/david/Downloads/subset \
+  --supernet-path cnnSearch/best_model.pth \
+  --architecture-json /path/to/architecture.json \
+  --batch-size 32 \
+  --num-workers 4
+```
 
 ## Logging configuration
 

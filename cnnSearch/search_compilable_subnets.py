@@ -7,14 +7,17 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import traceback
-import subprocess
-import shutil
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from cnnSearch.models.supernet import ResNetSuperNet
 from cnnSearch.models.subnet import extractSubnetFromSupernet
+from cnnSearch.model_pipeline import (
+    SubnetCompilationPipeline,
+    buildSearchSpaceForCheckpoint,
+    loadSupernetFromCheckpoint,
+)
 from cnnSearch.search_space import (
     sampleRandomArchitecture,
     DEFAULT_SEARCH_SPACE,
@@ -26,7 +29,6 @@ from cnnSearch.search_space import (
     architectureSimilarityScore,
     generateSimilarArchitectures,
 )
-from cnnSearch.export_utils import Imx500Exporter, RepresentativeDataGenerator
 
 DB_PATH = "compilation_search.json"
 VERIFIED_DB_PATH = "compilation_search_verified_candidates.json"
@@ -40,6 +42,12 @@ SIMILARITY_MAX_MUTATIONS = 2
 THRESHOLD_BAND_RATIO = 0.15
 PARAM_BYTES_FP32 = 4
 GPU_VISIBILITY_OVERRIDE: Optional[str] = None
+SUPERNET_CHECKPOINT_PATH: str = ""
+EVAL_DATASET_PATH: str = ""
+EVAL_BATCH_SIZE: int = 32
+EVAL_NUM_WORKERS: int = 4
+_SUPERNET_CACHE: Optional[ResNetSuperNet] = None
+_PIPELINE_CACHE: Optional[SubnetCompilationPipeline] = None
 
 
 def logEvent(eventType, message):
@@ -178,9 +186,27 @@ def getNextExperimentId(experiments: Sequence[Dict[str, Any]]) -> int:
 
 
 def getSupernetForSearchSpace() -> ResNetSuperNet:
-    supernet = ResNetSuperNet(SEARCH_SPACE)
-    supernet.eval()
-    return supernet
+    global _SUPERNET_CACHE
+    if _SUPERNET_CACHE is not None:
+        return _SUPERNET_CACHE
+
+    if SUPERNET_CHECKPOINT_PATH.strip() != "":
+        _SUPERNET_CACHE = loadSupernetFromCheckpoint(SUPERNET_CHECKPOINT_PATH, searchSpace=SEARCH_SPACE)
+    else:
+        supernet = ResNetSuperNet(SEARCH_SPACE)
+        supernet.eval()
+        _SUPERNET_CACHE = supernet
+    return _SUPERNET_CACHE
+
+
+def getCompilationPipeline() -> SubnetCompilationPipeline:
+    global _PIPELINE_CACHE
+    if _PIPELINE_CACHE is None:
+        _PIPELINE_CACHE = SubnetCompilationPipeline(
+            searchSpace=SEARCH_SPACE,
+            calibrationImagesDir=CALIBRATION_IMAGES_DIR,
+        )
+    return _PIPELINE_CACHE
 
 
 def getNormalizedArchitectureConfig(configData: Any) -> ArchitectureConfig:
@@ -282,9 +308,6 @@ def populate_candidates(target_count=None):
         logEvent("INFO", "No new candidates added")
 
 def attempt_compilation(config_data, experiment_id):
-    output_onnx = f"temp_quant_{experiment_id}.onnx"
-    output_compile_dir = f"temp_compile_{experiment_id}"
-
     try:
         if isinstance(config_data, str):
             config_dict = json.loads(config_data)
@@ -294,71 +317,40 @@ def attempt_compilation(config_data, experiment_id):
         parsedConfig = ArchitectureConfig(**config_dict)
         config = normalizeArchitectureForSearchSpace(parsedConfig, SEARCH_SPACE, enableAuxiliaryHeads=False)
         
+        pipeline = getCompilationPipeline()
         supernet = getSupernetForSearchSpace()
-        subnet_data = extractSubnetFromSupernet(supernet, config, searchSpace=SEARCH_SPACE)
-        model = subnet_data.model
-        model.eval()
-        
-        # Prepare for export
-        calib_gen = RepresentativeDataGenerator(
-            CALIBRATION_IMAGES_DIR,
-            input_shape=(3, config.inputResolution, config.inputResolution),
-            batch_size=1,
-            num_images=1, # 1 image as requested
-            device='cpu' 
+        pipelineResult = pipeline.quantizeCompileEvaluateArchitecture(
+            supernetModel=supernet,
+            architectureConfig=config,
+            experimentLabel=f"{experiment_id}",
+            compilerEnvironment=getCompilerEnvironment(),
+            evaluationDatasetPath=EVAL_DATASET_PATH if EVAL_DATASET_PATH.strip() != "" else None,
+            evaluationBatchSize=EVAL_BATCH_SIZE,
+            evaluationNumWorkers=EVAL_NUM_WORKERS,
+            keepArtifacts=False,
         )
-        
-        exporter = Imx500Exporter(device='cpu')
-        exporter.quantize(model, calib_gen, output_onnx)
-        
-        # Run compilation using imxconv-pt
-        # Command: imxconv-pt -i {onnx_quant_path} -o ./imx500_output --no-input-persistency --overwrite
-        cmd = [
-            "imxconv-pt",
-            "-i", output_onnx,
-            "-o", output_compile_dir,
-            "--no-input-persistency",
-            "--overwrite"
-        ]
-        
-        # Run command and capture output
-        result = subprocess.run(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
-            text=True,
-            env=getCompilerEnvironment(),
-        )
-        
-        if result.returncode != 0:
-            error_details = result.stderr if result.stderr else result.stdout
-            raise RuntimeError(f"IMX500 Compilation failed (code {result.returncode}): {error_details}")
-        
-        # Cleanup on success
-        if os.path.exists(output_onnx):
-            os.remove(output_onnx)
-        if os.path.exists(output_compile_dir):
-            shutil.rmtree(output_compile_dir)
-            
+
+        if not pipelineResult.compilation.success:
+            errorDetails = pipelineResult.compilation.errorMessage
+            raise RuntimeError(errorDetails if errorDetails is not None else "Unknown compilation error")
+
+        evaluationMetrics = None
+        if pipelineResult.evaluation is not None:
+            evaluationMetrics = {
+                "loss": float(pipelineResult.evaluation.loss),
+                "top1": float(pipelineResult.evaluation.top1),
+                "top5": float(pipelineResult.evaluation.top5),
+                "num_samples": int(pipelineResult.evaluation.numSamples),
+                "num_classes": int(pipelineResult.evaluation.numClasses),
+            }
+
         logEvent("SUCCESS", f"Compilation succeeded for candidate {experiment_id}")
-        return "SUCCESS", None
+        return "SUCCESS", None, evaluationMetrics
 
     except Exception as e:
-        # Cleanup on failure
-        if os.path.exists(output_onnx):
-            try:
-                os.remove(output_onnx)
-            except OSError:
-                pass
-        if os.path.exists(output_compile_dir):
-            try:
-                shutil.rmtree(output_compile_dir)
-            except OSError:
-                pass
-
         logEvent("FAILED", f"Compilation failed for candidate {experiment_id}: {e}")
         traceback.print_exc()
-        return "FAILED", str(e)
+        return "FAILED", str(e), None
 
 
 def compileExperimentAtIndex(experiments: List[Dict[str, Any]], candidateIndex: int) -> str:
@@ -366,9 +358,10 @@ def compileExperimentAtIndex(experiments: List[Dict[str, Any]], candidateIndex: 
     status = str(experiment.get('status', 'PENDING'))
     if status == "PENDING":
         logEvent("CHECK", f"Checking candidate {experiment['id']} (Params: {experiment['param_count']})")
-        compiledStatus, errorMessage = attempt_compilation(experiment['config'], experiment['id'])
+        compiledStatus, errorMessage, evaluationMetrics = attempt_compilation(experiment['config'], experiment['id'])
         experiment['status'] = compiledStatus
         experiment['error_msg'] = errorMessage
+        experiment['evaluation'] = evaluationMetrics
         save_db(experiments)
         status = compiledStatus
     return status
@@ -648,6 +641,9 @@ def saveVerifiedCandidatesDb(
             "source": str(experiment.get('source', 'SAMPLED')),
         }
 
+        if experiment.get("evaluation") is not None:
+            record["evaluation"] = dict(experiment["evaluation"])
+
         if str(experiment.get('status')) == "SUCCESS":
             verifiedCompilable.append(record)
 
@@ -737,12 +733,39 @@ def main():
     parser.add_argument("--enable-complex-paths", action="store_true", help="Enable complex SE and dilated paths (paths 3 and 4) which are disabled by default")
     parser.add_argument("--dv", type=str, default="", help="Database file path to continue from. Leave empty to create compilation_search_<datetime>.json")
     parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs to claim with safe_gpu before compilation checks")
+    parser.add_argument("--supernet-checkpoint", type=str, default="", help="Path to trained supernet checkpoint used for subnet extraction/evaluation")
+    parser.add_argument("--eval-dataset", type=str, default="", help="Optional ImageFolder dataset path. If set, evaluates each successfully compiled ONNX candidate")
+    parser.add_argument("--eval-batch-size", type=int, default=32, help="Batch size for ONNX evaluation")
+    parser.add_argument("--eval-num-workers", type=int, default=4, help="DataLoader workers for ONNX evaluation")
     args = parser.parse_args()
     
     global SEARCH_SPACE
     global GPU_VISIBILITY_OVERRIDE
+    global SUPERNET_CHECKPOINT_PATH
+    global EVAL_DATASET_PATH
+    global EVAL_BATCH_SIZE
+    global EVAL_NUM_WORKERS
     from cnnSearch.search_space import getSearchSpace
     SEARCH_SPACE = getSearchSpace(useComplexPaths=args.enable_complex_paths)
+
+    SUPERNET_CHECKPOINT_PATH = args.supernet_checkpoint.strip()
+    EVAL_DATASET_PATH = args.eval_dataset.strip()
+    EVAL_BATCH_SIZE = int(args.eval_batch_size)
+    EVAL_NUM_WORKERS = int(args.eval_num_workers)
+
+    if SUPERNET_CHECKPOINT_PATH != "":
+        SEARCH_SPACE = buildSearchSpaceForCheckpoint(
+            SUPERNET_CHECKPOINT_PATH,
+            useComplexPaths=args.enable_complex_paths,
+        )
+        logEvent("INFO", f"Using supernet checkpoint: {SUPERNET_CHECKPOINT_PATH}")
+    else:
+        logEvent("WARN", "No --supernet-checkpoint provided; using randomly initialized supernet weights")
+
+    if EVAL_DATASET_PATH != "":
+        logEvent("INFO", f"Enabled per-candidate evaluation on dataset: {EVAL_DATASET_PATH}")
+    else:
+        logEvent("INFO", "Per-candidate ONNX evaluation is disabled")
 
     GPU_VISIBILITY_OVERRIDE = claimSchedulerAssignedGpus(numGpus=args.num_gpus)
     if GPU_VISIBILITY_OVERRIDE is not None and GPU_VISIBILITY_OVERRIDE.strip() != "":

@@ -9,7 +9,7 @@
 5. Add learned path-fusion gate ablation (equal fixed weights vs learnable weights).
 6. Extend evaluation runner to include auxiliary-head and per-path contribution diagnostics.
 7. Add Pareto metrics reporting (hypervolume, front spread, convergence curves).
-8. Integrate quantization/compression evaluation hooks into candidate scoring pipeline.
+8. Extend candidate scoring to combine compilability + ONNX top-1/top-5 metrics into a single ranking objective.
 9. Add latency surrogate calibration workflow against measured device/runtime latency.
 10. Add rank-correlation checks between supernet proxy ranking and standalone subnet retraining.
 11. Add HPC launcher scripts for long-running search experiments.
@@ -18,3 +18,4 @@
 14. Add CLI knobs to `search_compilable_subnets.py` for similarity budget, threshold band ratio, and dense boundary width.
 15. Add regression tests for DB resume behavior (`--dv`) and verified-summary JSON schema.
 16. Add optional hardware-memory metric integration (compiler-reported memory) to complement parameter-memory proxy envelope.
+17. Add end-to-end smoke test for `cnnSearch/engine.py` using mocked quantization/compilation pipeline outputs.

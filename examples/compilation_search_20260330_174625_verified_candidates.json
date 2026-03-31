@@ -1,0 +1,468 @@
+{
+  "source_db": "compilation_search_20260330_174625.json",
+  "generated_at": "2026-03-31T00:58:35.861221",
+  "search_space_mode": "simplified",
+  "compilable_envelope": {
+    "smallestCompilable": {
+      "id": 75204,
+      "param_count": 6164712,
+      "param_memory_bytes": 24658848,
+      "param_memory_mib": 23.516510009765625,
+      "config": {
+        "inputResolution": 224,
+        "outputStride": 32,
+        "stageDepths": [
+          2,
+          4,
+          1,
+          3
+        ],
+        "stageWidthMultipliers": [
+          1.0,
+          1.0,
+          0.75,
+          0.5
+        ],
+        "stemChannels": 64,
+        "stemPathIndex": 1,
+        "stagePathIndices": [
+          2,
+          1,
+          2,
+          0
+        ],
+        "stageKernelSizes": [
+          3,
+          3,
+          5,
+          3
+        ],
+        "stageExtraStrides": [
+          1,
+          2,
+          2,
+          2
+        ],
+        "enableAuxiliaryHeads": false
+      }
+    },
+    "largestCompilable": {
+      "id": 79329,
+      "param_count": 6700952,
+      "param_memory_bytes": 26803808,
+      "param_memory_mib": 25.562103271484375,
+      "config": {
+        "inputResolution": 256,
+        "outputStride": 32,
+        "stageDepths": [
+          1,
+          2,
+          1,
+          2
+        ],
+        "stageWidthMultipliers": [
+          0.5,
+          1.0,
+          0.5,
+          0.75
+        ],
+        "stemChannels": 32,
+        "stemPathIndex": 0,
+        "stagePathIndices": [
+          0,
+          2,
+          0,
+          1
+        ],
+        "stageKernelSizes": [
+          3,
+          3,
+          5,
+          3
+        ],
+        "stageExtraStrides": [
+          1,
+          2,
+          1,
+          1
+        ],
+        "enableAuxiliaryHeads": false
+      }
+    },
+    "numCompilable": 3
+  },
+  "verified_compilable_architectures": [
+    {
+      "id": 75204,
+      "config": {
+        "inputResolution": 224,
+        "outputStride": 32,
+        "stageDepths": [
+          2,
+          4,
+          1,
+          3
+        ],
+        "stageWidthMultipliers": [
+          1.0,
+          1.0,
+          0.75,
+          0.5
+        ],
+        "stemChannels": 64,
+        "stemPathIndex": 1,
+        "stagePathIndices": [
+          2,
+          1,
+          2,
+          0
+        ],
+        "stageKernelSizes": [
+          3,
+          3,
+          5,
+          3
+        ],
+        "stageExtraStrides": [
+          1,
+          2,
+          2,
+          2
+        ],
+        "enableAuxiliaryHeads": false
+      },
+      "param_count": 6164712,
+      "param_memory_bytes": 24658848,
+      "param_memory_mib": 23.516510009765625,
+      "status": "SUCCESS",
+      "source": "SAMPLED"
+    },
+    {
+      "id": 92300,
+      "config": {
+        "inputResolution": 288,
+        "outputStride": 16,
+        "stageDepths": [
+          2,
+          1,
+          2,
+          3
+        ],
+        "stageWidthMultipliers": [
+          0.75,
+          0.75,
+          0.5,
+          0.5
+        ],
+        "stemChannels": 32,
+        "stemPathIndex": 0,
+        "stagePathIndices": [
+          2,
+          0,
+          1,
+          2
+        ],
+        "stageKernelSizes": [
+          7,
+          3,
+          7,
+          3
+        ],
+        "stageExtraStrides": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "enableAuxiliaryHeads": false
+      },
+      "param_count": 6424408,
+      "param_memory_bytes": 25697632,
+      "param_memory_mib": 24.507171630859375,
+      "status": "SUCCESS",
+      "source": "SAMPLED"
+    },
+    {
+      "id": 7348,
+      "config": {
+        "inputResolution": 224,
+        "outputStride": 16,
+        "stageDepths": [
+          1,
+          1,
+          4,
+          2
+        ],
+        "stageWidthMultipliers": [
+          1.0,
+          0.5,
+          0.5,
+          0.75
+        ],
+        "stemChannels": 32,
+        "stemPathIndex": 1,
+        "stagePathIndices": [
+          2,
+          0,
+          1,
+          2
+        ],
+        "stageKernelSizes": [
+          5,
+          3,
+          5,
+          3
+        ],
+        "stageExtraStrides": [
+          1,
+          2,
+          2,
+          2
+        ],
+        "enableAuxiliaryHeads": false
+      },
+      "param_count": 6552328,
+      "param_memory_bytes": 26209312,
+      "param_memory_mib": 24.995147705078125,
+      "status": "SUCCESS",
+      "source": "SAMPLED"
+    }
+  ],
+  "likely_compilable_candidates": [
+    {
+      "id": 100001,
+      "config": {
+        "inputResolution": 224,
+        "outputStride": 32,
+        "stageDepths": [
+          1,
+          2,
+          1,
+          2
+        ],
+        "stageWidthMultipliers": [
+          0.5,
+          1.0,
+          0.5,
+          0.75
+        ],
+        "stemChannels": 32,
+        "stemPathIndex": 0,
+        "stagePathIndices": [
+          0,
+          2,
+          0,
+          1
+        ],
+        "stageKernelSizes": [
+          3,
+          3,
+          5,
+          3
+        ],
+        "stageExtraStrides": [
+          1,
+          2,
+          1,
+          1
+        ],
+        "enableAuxiliaryHeads": false
+      },
+      "param_count": 6700952,
+      "param_memory_bytes": 26803808,
+      "param_memory_mib": 25.562103271484375,
+      "status": "SUCCESS",
+      "source": "SIMILARITY",
+      "predicted_similarity": 0.9895833333333334,
+      "predicted_likely_score": 0.9927083333333333
+    },
+    {
+      "id": 100002,
+      "config": {
+        "inputResolution": 288,
+        "outputStride": 32,
+        "stageDepths": [
+          1,
+          2,
+          1,
+          2
+        ],
+        "stageWidthMultipliers": [
+          0.5,
+          1.0,
+          0.5,
+          0.75
+        ],
+        "stemChannels": 32,
+        "stemPathIndex": 0,
+        "stagePathIndices": [
+          0,
+          2,
+          0,
+          1
+        ],
+        "stageKernelSizes": [
+          3,
+          3,
+          5,
+          3
+        ],
+        "stageExtraStrides": [
+          1,
+          2,
+          1,
+          1
+        ],
+        "enableAuxiliaryHeads": false
+      },
+      "param_count": 6700952,
+      "param_memory_bytes": 26803808,
+      "param_memory_mib": 25.562103271484375,
+      "status": "SUCCESS",
+      "source": "SIMILARITY",
+      "predicted_similarity": 0.9895833333333334,
+      "predicted_likely_score": 0.9927083333333333
+    },
+    {
+      "id": 100003,
+      "config": {
+        "inputResolution": 288,
+        "outputStride": 16,
+        "stageDepths": [
+          3,
+          2,
+          2,
+          1
+        ],
+        "stageWidthMultipliers": [
+          0.75,
+          1.0,
+          0.75,
+          0.75
+        ],
+        "stemChannels": 48,
+        "stemPathIndex": 1,
+        "stagePathIndices": [
+          0,
+          1,
+          0,
+          2
+        ],
+        "stageKernelSizes": [
+          3,
+          7,
+          3,
+          3
+        ],
+        "stageExtraStrides": [
+          1,
+          2,
+          1,
+          2
+        ],
+        "enableAuxiliaryHeads": false
+      },
+      "param_count": 6698088,
+      "param_memory_bytes": 26792352,
+      "param_memory_mib": 25.551177978515625,
+      "status": "SUCCESS",
+      "source": "SIMILARITY",
+      "predicted_similarity": 0.9916666666666667,
+      "predicted_likely_score": 0.9925643990253119
+    },
+    {
+      "id": 100004,
+      "config": {
+        "inputResolution": 224,
+        "outputStride": 16,
+        "stageDepths": [
+          3,
+          4,
+          1,
+          3
+        ],
+        "stageWidthMultipliers": [
+          0.75,
+          0.5,
+          0.75,
+          0.5
+        ],
+        "stemChannels": 64,
+        "stemPathIndex": 0,
+        "stagePathIndices": [
+          0,
+          2,
+          1,
+          1
+        ],
+        "stageKernelSizes": [
+          3,
+          3,
+          7,
+          3
+        ],
+        "stageExtraStrides": [
+          1,
+          1,
+          1,
+          2
+        ],
+        "enableAuxiliaryHeads": false
+      },
+      "param_count": 6699352,
+      "param_memory_bytes": 26797408,
+      "param_memory_mib": 25.555999755859375,
+      "status": "SUCCESS",
+      "source": "SIMILARITY",
+      "predicted_similarity": 0.9895833333333334,
+      "predicted_likely_score": 0.9918132117459844
+    },
+    {
+      "id": 100005,
+      "config": {
+        "inputResolution": 224,
+        "outputStride": 32,
+        "stageDepths": [
+          3,
+          1,
+          6,
+          1
+        ],
+        "stageWidthMultipliers": [
+          0.75,
+          0.75,
+          0.75,
+          0.5
+        ],
+        "stemChannels": 32,
+        "stemPathIndex": 1,
+        "stagePathIndices": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "stageKernelSizes": [
+          5,
+          3,
+          3,
+          5
+        ],
+        "stageExtraStrides": [
+          1,
+          2,
+          1,
+          1
+        ],
+        "enableAuxiliaryHeads": false
+      },
+      "param_count": 6698312,
+      "param_memory_bytes": 26793248,
+      "param_memory_mib": 25.552032470703125,
+      "status": "SUCCESS",
+      "source": "SIMILARITY",
+      "predicted_similarity": 0.9895833333333334,
+      "predicted_likely_score": 0.9912313827142076
+    }
+  ]
+}

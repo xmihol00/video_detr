@@ -1,5 +1,32 @@
 # PROGRESS
 
+## 2026-03-31
+
+- Added a reusable quantize/compile/evaluate pipeline in `cnnSearch/model_pipeline.py`:
+  - `SubnetCompilationPipeline` for subnet extraction from supernet, IMX500 quantization/export, and `imxconv-pt` compilation checks,
+  - `OnnxClassificationEvaluator` for ONNXRuntime top-1/top-5/loss evaluation on ImageFolder datasets,
+  - checkpoint helpers to infer `numClasses` from supernet weights and construct matching search-space runtime config.
+- Implemented standalone evaluation CLI in `cnnSearch/engine.py`:
+  - direct ONNX evaluation mode (`--quantized-onnx-path` + `--dataset-path`),
+  - supernet-driven mode that quantizes, compiles, and evaluates architectures from either
+    - `--compilation-json` (batch mode for all candidates), or
+    - `--architecture-json` (single architecture mode),
+  - formatted console summary plus JSON output support (`--output-json`).
+- Integrated the shared pipeline into `cnnSearch/search_compilable_subnets.py`:
+  - replaced duplicated quantize/compile logic with `SubnetCompilationPipeline`,
+  - added optional per-candidate evaluation after successful compilation only,
+  - persisted evaluation metrics into DB records and verified-candidates summary JSON.
+- Extended `search_compilable_subnets.py` CLI with:
+  - `--supernet-checkpoint`,
+  - `--eval-dataset`,
+  - `--eval-batch-size`,
+  - `--eval-num-workers`.
+- Added regression tests:
+  - `tests/test_cnn_engine_candidate_loading.py` for deduplicated candidate extraction from verified-candidates JSON,
+  - `tests/test_search_compilable_subnets_verified_summary.py` for verified-summary payload including evaluation metrics.
+- Validation run:
+  - `pytest -q tests/test_cnn_engine_candidate_loading.py tests/test_search_compilable_subnets_verified_summary.py` → `2 passed`.
+
 ## 2026-03-30
 
 - Improved IMX500 compilation search flow in `cnnSearch/search_compilable_subnets.py`:
