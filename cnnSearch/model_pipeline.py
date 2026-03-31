@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import os
 import re
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import ImageFolder
 
 from cnnSearch.augmentations import buildEvalTransform
@@ -59,6 +60,48 @@ class CandidatePipelineResult:
     quantizedOnnxPath: str
     compilation: CompilationResult
     evaluation: Optional[EvaluationResult]
+
+
+def selectOnnxExecutionProviders(
+    availableProviders: Sequence[str],
+    requestedProviders: Optional[Sequence[str]] = None,
+    preferCuda: bool = True,
+) -> List[str]:
+    availableSet = set(str(provider) for provider in availableProviders)
+
+    if requestedProviders is not None:
+        return [str(provider) for provider in requestedProviders if str(provider) in availableSet]
+
+    providerPreference: List[str] = []
+    if preferCuda:
+        providerPreference.append("CUDAExecutionProvider")
+    providerPreference.append("CPUExecutionProvider")
+
+    selectedProviders = [provider for provider in providerPreference if provider in availableSet]
+    if selectedProviders:
+        return selectedProviders
+
+    if availableProviders:
+        return [str(provider) for provider in availableProviders]
+    return ["CPUExecutionProvider"]
+
+
+def getOrtSessionOptionsFromMctQuantizers() -> Any:
+    """Return ORT session options registering MCT custom ops when available."""
+    try:
+        from mct_quantizers import get_ort_session_options as getOrtSessionOptions  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        return getOrtSessionOptions()
+    except Exception:
+        return None
+
+
+def _logPipeline(message: str) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[pipeline {timestamp}] {message}")
 
 
 def withSearchSpaceNumClasses(searchSpace: SearchSpaceConfig, numClasses: int) -> SearchSpaceConfig:
@@ -196,6 +239,12 @@ class OnnxClassificationEvaluator:
         batchSize: int = 32,
         numWorkers: int = 4,
         providers: Optional[Sequence[str]] = None,
+        preferCuda: bool = True,
+        requireCuda: bool = False,
+        maxImages: Optional[int] = None,
+        logEveryBatches: int = 20,
+        progressPrefix: str = "",
+        enableProgressLogging: bool = True,
     ) -> None:
         try:
             import onnxruntime as ort  # type: ignore
@@ -203,23 +252,39 @@ class OnnxClassificationEvaluator:
             raise ImportError("onnxruntime is required for ONNX model evaluation") from importError
 
         self._ort = ort
+        self._sessionOptions = getOrtSessionOptionsFromMctQuantizers()
         self.datasetPath = datasetPath
         self.imageSize = int(imageSize)
         self.batchSize = int(batchSize)
         self.numWorkers = int(numWorkers)
+        self.preferCuda = bool(preferCuda)
+        self.requireCuda = bool(requireCuda)
+        self.maxImages = int(maxImages) if maxImages is not None and int(maxImages) > 0 else None
+        self.logEveryBatches = max(1, int(logEveryBatches))
+        self.progressPrefix = progressPrefix.strip()
+        self.enableProgressLogging = bool(enableProgressLogging)
 
-        availableProviders = set(self._ort.get_available_providers())
-        if providers is not None:
-            self.providers = [provider for provider in providers if provider in availableProviders]
-        else:
-            providerPreference = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            self.providers = [provider for provider in providerPreference if provider in availableProviders]
+        self.availableProviders = [str(provider) for provider in self._ort.get_available_providers()]
+        self.providers = selectOnnxExecutionProviders(
+            availableProviders=self.availableProviders,
+            requestedProviders=providers,
+            preferCuda=self.preferCuda,
+        )
 
-        if not self.providers:
-            self.providers = ["CPUExecutionProvider"]
+        if self.requireCuda and "CUDAExecutionProvider" not in self.providers:
+            raise RuntimeError(
+                "CUDA execution provider is required but unavailable. "
+                f"Available ORT providers: {self.availableProviders}. "
+                "Install GPU-enabled ONNX Runtime (e.g. onnxruntime-gpu) or disable --require-cuda."
+            )
 
-    def _buildDataLoader(self) -> tuple[DataLoader, int]:
-        evalDataset = ImageFolder(self.datasetPath, transform=buildEvalTransform(self.imageSize))
+    def _buildDataLoader(self) -> tuple[DataLoader, int, int]:
+        fullDataset = ImageFolder(self.datasetPath, transform=buildEvalTransform(self.imageSize))
+        numClasses = len(fullDataset.classes)
+        evalDataset = fullDataset
+        if self.maxImages is not None and self.maxImages < len(evalDataset):
+            evalDataset = Subset(evalDataset, list(range(self.maxImages)))
+
         dataLoader = DataLoader(
             evalDataset,
             batch_size=self.batchSize,
@@ -229,21 +294,60 @@ class OnnxClassificationEvaluator:
             drop_last=False,
             persistent_workers=self.numWorkers > 0,
         )
-        return dataLoader, len(evalDataset.classes)
+        return dataLoader, numClasses, len(evalDataset)
+
+    def _progressTag(self) -> str:
+        return f"[{self.progressPrefix}] " if self.progressPrefix != "" else ""
 
     def evaluateModel(self, onnxModelPath: str) -> EvaluationResult:
-        dataLoader, numClasses = self._buildDataLoader()
+        dataLoader, numClasses, totalImages = self._buildDataLoader()
+        totalBatches = len(dataLoader)
 
-        session = self._ort.InferenceSession(onnxModelPath, providers=list(self.providers))
+        try:
+            session = self._ort.InferenceSession(
+                onnxModelPath,
+                sess_options=self._sessionOptions,
+                providers=list(self.providers),
+            )
+        except Exception as sessionError:
+            errorText = str(sessionError)
+            usesMctCustomOps = (
+                "ActivationPOTQuantizer" in errorText
+                or "mct_quantizers" in errorText
+                or "is not a registered function/op" in errorText
+            )
+            if usesMctCustomOps:
+                raise RuntimeError(
+                    "Failed to load quantized ONNX in ONNXRuntime due to missing MCT custom ops registration. "
+                    "Install/import `mct_quantizers` in this environment and ensure "
+                    "`mct_quantizers.get_ort_session_options()` is available."
+                ) from sessionError
+            raise
+
         modelInputName = session.get_inputs()[0].name
+
+        if self.enableProgressLogging:
+            _logPipeline(
+                f"{self._progressTag()}ONNX evaluation start: {totalImages} images, "
+                f"{totalBatches} batches, batchSize={self.batchSize}, requestedProviders={self.providers}, "
+                f"availableProviders={self.availableProviders}"
+            )
 
         totalLoss = 0.0
         totalTop1Correct = 0
         totalTop5Correct = 0
         totalSamples = 0
+        import time
+        wallStart = time.time()
 
-        for images, labels in dataLoader:
-            logitsOutput = session.run(None, {modelInputName: images.detach().cpu().numpy()})[0]
+        for batchIndex, (images, labels) in enumerate(dataLoader, start=1):
+            try:
+                logitsOutput = session.run(None, {modelInputName: images.detach().cpu().numpy()})[0]
+            except KeyboardInterrupt as interruptError:
+                raise KeyboardInterrupt(
+                    "Interrupted during ONNXRuntime execution. "
+                    "For faster diagnostics, rerun with smaller `--max-eval-images` or `--max-candidates`."
+                ) from interruptError
             logitsTensor = torch.from_numpy(logitsOutput)
             labelsTensor = labels.detach().cpu().long()
 
@@ -259,14 +363,31 @@ class OnnxClassificationEvaluator:
             totalTop5Correct += int(top5Matches.sum().item())
             totalSamples += int(labelsTensor.shape[0])
 
+            if self.enableProgressLogging and (batchIndex % self.logEveryBatches == 0 or batchIndex == totalBatches):
+                elapsed = max(1e-6, time.time() - wallStart)
+                imagesPerSecond = float(totalSamples) / elapsed
+                _logPipeline(
+                    f"{self._progressTag()}ONNX evaluation progress: batch {batchIndex}/{totalBatches}, "
+                    f"processed={totalSamples}/{totalImages} images, throughput={imagesPerSecond:.2f} img/s"
+                )
+
         safeDenominator = max(1, totalSamples)
-        return EvaluationResult(
+        result = EvaluationResult(
             loss=float(totalLoss / safeDenominator),
             top1=float(100.0 * totalTop1Correct / safeDenominator),
             top5=float(100.0 * totalTop5Correct / safeDenominator),
             numSamples=int(totalSamples),
             numClasses=int(numClasses),
         )
+        if self.enableProgressLogging:
+            elapsed = max(1e-6, time.time() - wallStart)
+            activeProviders = session.get_providers()
+            _logPipeline(
+                f"{self._progressTag()}ONNX evaluation done: top1={result.top1:.3f}, "
+                f"top5={result.top5:.3f}, loss={result.loss:.5f}, elapsed={elapsed:.2f}s, "
+                f"activeProviders={activeProviders}"
+            )
+        return result
 
 
 class SubnetCompilationPipeline:
@@ -395,6 +516,10 @@ class SubnetCompilationPipeline:
         evaluationDatasetPath: Optional[str] = None,
         evaluationBatchSize: int = 32,
         evaluationNumWorkers: int = 4,
+        evaluationRequireCuda: bool = False,
+        evaluationMaxImages: Optional[int] = None,
+        evaluationLogEveryBatches: int = 20,
+        enableProgressLogging: bool = True,
         skipCompilation: bool = False,
         keepArtifacts: bool = False,
         artifactsRootDir: Optional[str] = None,
@@ -412,11 +537,18 @@ class SubnetCompilationPipeline:
         compilationResult: Optional[CompilationResult] = None
         evaluationResult: Optional[EvaluationResult] = None
         try:
+            if enableProgressLogging:
+                _logPipeline(f"[{experimentLabel}] Quantization started")
             quantizationResult = self.quantizeSubnet(
                 supernetModel=supernetModel,
                 architectureConfig=architectureConfig,
                 outputOnnxPath=onnxPath,
             )
+            if enableProgressLogging:
+                _logPipeline(
+                    f"[{experimentLabel}] Quantization finished: params={quantizationResult.paramCount}, "
+                    f"input={quantizationResult.architectureConfig.inputResolution}"
+                )
 
             if skipCompilation:
                 compilationResult = CompilationResult(
@@ -427,12 +559,19 @@ class SubnetCompilationPipeline:
                     stderr="",
                     outputDirectory=compileOutputDirectory,
                 )
+                if enableProgressLogging:
+                    _logPipeline(f"[{experimentLabel}] Compilation skipped by configuration")
             else:
+                if enableProgressLogging:
+                    _logPipeline(f"[{experimentLabel}] Compilation started")
                 compilationResult = self.compileQuantizedOnnx(
                     onnxPath=quantizationResult.onnxPath,
                     outputDirectory=compileOutputDirectory,
                     compilerEnvironment=compilerEnvironment,
                 )
+                if enableProgressLogging:
+                    compileStatus = "SUCCESS" if compilationResult.success else "FAILED"
+                    _logPipeline(f"[{experimentLabel}] Compilation {compileStatus}")
 
             if compilationResult.success and evaluationDatasetPath is not None and evaluationDatasetPath.strip() != "":
                 evaluator = OnnxClassificationEvaluator(
@@ -440,6 +579,12 @@ class SubnetCompilationPipeline:
                     imageSize=quantizationResult.architectureConfig.inputResolution,
                     batchSize=evaluationBatchSize,
                     numWorkers=evaluationNumWorkers,
+                    preferCuda=True,
+                    requireCuda=evaluationRequireCuda,
+                    maxImages=evaluationMaxImages,
+                    logEveryBatches=evaluationLogEveryBatches,
+                    progressPrefix=experimentLabel,
+                    enableProgressLogging=enableProgressLogging,
                 )
                 evaluationResult = evaluator.evaluateModel(quantizationResult.onnxPath)
 

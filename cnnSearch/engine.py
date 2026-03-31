@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional, Sequence
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -24,6 +25,16 @@ from cnnSearch.search_space import ArchitectureConfig, getSearchSpace
 
 CALIBRATION_IMAGES_DIR = os.path.join(os.path.dirname(__file__), "calibration_images")
 
+NUM_GPUS = 1
+import safe_gpu
+while True:
+    try:
+        safe_gpu.claim_gpus(NUM_GPUS)
+        break
+    except:
+        print("Waiting for free GPU")
+        time.sleep(5)
+        pass
 
 def _formatFloat(value: Optional[float], digits: int = 3) -> str:
     if value is None:
@@ -89,6 +100,11 @@ def _printResultSummary(results: Sequence[Dict[str, Any]]) -> None:
         print(f"{candidateId:>8} | {source:>10} | {compiledFlag:>8} | {params:>10} | {top1:>8} | {top5:>8} | {loss:>10}")
 
     print("=" * 96)
+
+
+def _logEngine(message: str) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[engine {timestamp}] {message}")
 
 
 def _candidateResultToRecord(
@@ -174,6 +190,14 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--output-json", type=str, default="")
     parser.add_argument("--keep-artifacts", action="store_true")
     parser.add_argument("--artifacts-root", type=str, default="")
+    parser.add_argument("--max-candidates", type=int, default=0, help="Evaluate only first N candidates (0 = all)")
+    parser.add_argument("--max-eval-images", type=int, default=0, help="Evaluate only first N dataset images per candidate (0 = all)")
+    parser.add_argument("--log-every-batches", type=int, default=20, help="Print ONNX evaluation progress every N batches")
+    parser.add_argument(
+        "--require-cuda",
+        action="store_true",
+        help="Fail if CUDAExecutionProvider is unavailable in ONNX Runtime",
+    )
     parser.add_argument(
         "--skip-compilation",
         action="store_true",
@@ -183,11 +207,18 @@ def parseArguments() -> argparse.Namespace:
 
 
 def _evaluateDirectOnnx(args: argparse.Namespace) -> Dict[str, Any]:
+    _logEngine("Starting direct ONNX evaluation mode")
     evaluator = OnnxClassificationEvaluator(
         datasetPath=args.dataset_path,
         imageSize=224,
         batchSize=args.batch_size,
         numWorkers=args.num_workers,
+        preferCuda=True,
+        requireCuda=bool(args.require_cuda),
+        maxImages=(args.max_eval_images if int(args.max_eval_images) > 0 else None),
+        logEveryBatches=int(args.log_every_batches),
+        progressPrefix="onnx_only",
+        enableProgressLogging=True,
     )
     evaluationResult = evaluator.evaluateModel(args.quantized_onnx_path)
     return {
@@ -223,6 +254,15 @@ def _evaluateSupernetArchitectures(args: argparse.Namespace) -> Dict[str, Any]:
     else:
         raise ValueError("When --supernet-path is provided, also specify --compilation-json or --architecture-json")
 
+    originalCandidateCount = len(candidates)
+    if int(args.max_candidates) > 0:
+        candidates = candidates[: int(args.max_candidates)]
+    _logEngine(
+        f"Prepared {len(candidates)} candidates (source had {originalCandidateCount}). "
+        f"skip_compilation={bool(args.skip_compilation)}, max_eval_images={int(args.max_eval_images)}, "
+        f"require_cuda={bool(args.require_cuda)}"
+    )
+
     useComplexPaths = _resolveSearchSpaceMode(
         cliEnableComplexPaths=bool(args.enable_complex_paths),
         explicitArchitectures=architectureConfigsForMode,
@@ -237,22 +277,36 @@ def _evaluateSupernetArchitectures(args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     perCandidateResults: List[Dict[str, Any]] = []
-    for candidate in candidates:
+    interrupted = False
+    for candidateIndex, candidate in enumerate(candidates, start=1):
         architectureConfig = parseArchitectureConfig(candidate["config"])
         candidateId = int(candidate.get("id", 0)) if candidate.get("id") is not None else None
         source = str(candidate.get("source", "UNKNOWN"))
+        candidateTag = f"{candidateIndex}/{len(candidates)} id={candidateId if candidateId is not None else '-'}"
 
-        pipelineResult = pipeline.quantizeCompileEvaluateArchitecture(
-            supernetModel=supernetModel,
-            architectureConfig=architectureConfig,
-            experimentLabel=f"cand_{candidateId if candidateId is not None else len(perCandidateResults)+1}",
-            evaluationDatasetPath=args.dataset_path,
-            evaluationBatchSize=args.batch_size,
-            evaluationNumWorkers=args.num_workers,
-            skipCompilation=bool(args.skip_compilation),
-            keepArtifacts=bool(args.keep_artifacts),
-            artifactsRootDir=artifactsRoot,
-        )
+        _logEngine(f"Candidate {candidateTag} started (source={source})")
+        candidateStart = time.time()
+
+        try:
+            pipelineResult = pipeline.quantizeCompileEvaluateArchitecture(
+                supernetModel=supernetModel,
+                architectureConfig=architectureConfig,
+                experimentLabel=f"cand_{candidateId if candidateId is not None else len(perCandidateResults)+1}",
+                evaluationDatasetPath=args.dataset_path,
+                evaluationBatchSize=args.batch_size,
+                evaluationNumWorkers=args.num_workers,
+                evaluationRequireCuda=bool(args.require_cuda),
+                evaluationMaxImages=(args.max_eval_images if int(args.max_eval_images) > 0 else None),
+                evaluationLogEveryBatches=int(args.log_every_batches),
+                enableProgressLogging=True,
+                skipCompilation=bool(args.skip_compilation),
+                keepArtifacts=bool(args.keep_artifacts),
+                artifactsRootDir=artifactsRoot,
+            )
+        except KeyboardInterrupt:
+            interrupted = True
+            _logEngine(f"Interrupted during candidate {candidateTag}. Returning partial results")
+            break
 
         perCandidateResults.append(
             _candidateResultToRecord(
@@ -261,6 +315,8 @@ def _evaluateSupernetArchitectures(args: argparse.Namespace) -> Dict[str, Any]:
                 pipelineResult=pipelineResult,
             )
         )
+        elapsed = max(1e-6, time.time() - candidateStart)
+        _logEngine(f"Candidate {candidateTag} finished in {elapsed:.2f}s")
 
     _printResultSummary(perCandidateResults)
 
@@ -270,6 +326,8 @@ def _evaluateSupernetArchitectures(args: argparse.Namespace) -> Dict[str, Any]:
         "dataset_path": args.dataset_path,
         "use_complex_paths": bool(useComplexPaths),
         "skip_compilation": bool(args.skip_compilation),
+        "require_cuda": bool(args.require_cuda),
+        "interrupted": bool(interrupted),
         "results": perCandidateResults,
     }
 
