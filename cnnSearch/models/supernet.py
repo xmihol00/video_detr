@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-from typing import cast
 
 from cnnSearch.search_space import (
     ArchitectureConfig,
@@ -55,32 +54,6 @@ class SlimConv2d(nn.Module):
         return F.conv2d(inputs, weight, bias=None, stride=stride, padding=padding, dilation=dilation)
 
 
-class SlimBatchNorm2d(nn.Module):
-    def __init__(self, maxChannels: int) -> None:
-        super().__init__()
-        self.maxChannels = maxChannels
-        self.weight = nn.Parameter(torch.ones(maxChannels))
-        self.bias = nn.Parameter(torch.zeros(maxChannels))
-        self.register_buffer("runningMean", torch.zeros(maxChannels))
-        self.register_buffer("runningVar", torch.ones(maxChannels))
-        self.momentum = 0.1
-        self.eps = 1e-5
-
-    def forward(self, inputs: Tensor, activeChannels: int) -> Tensor:
-        runningMean = cast(Tensor, self.runningMean)
-        runningVar = cast(Tensor, self.runningVar)
-        return F.batch_norm(
-            inputs,
-            runningMean[:activeChannels],
-            runningVar[:activeChannels],
-            self.weight[:activeChannels],
-            self.bias[:activeChannels],
-            self.training,
-            self.momentum,
-            self.eps,
-        )
-
-
 class SlimBasicBlock(nn.Module):
     expansion = 1
 
@@ -102,12 +75,9 @@ class SlimBasicBlock(nn.Module):
 
         self.maxKernelSize = maxKernelSize
         self.conv1 = SlimConv2d(maxInChannels, maxOutChannels, kernelSize=maxKernelSize, stride=stride)
-        self.bn1 = SlimBatchNorm2d(maxOutChannels)
         self.conv2 = SlimConv2d(maxOutChannels, maxOutChannels, kernelSize=maxKernelSize, stride=1)
-        self.bn2 = SlimBatchNorm2d(maxOutChannels)
 
         self.downsampleConv = SlimConv2d(maxInChannels, maxOutChannels, kernelSize=1, stride=stride, padding=0)
-        self.downsampleBn = SlimBatchNorm2d(maxOutChannels)
         self.seReduce = SlimConv2d(maxOutChannels, max(8, maxOutChannels // 4), kernelSize=1, stride=1, padding=0)
         self.seExpand = SlimConv2d(max(8, maxOutChannels // 4), maxOutChannels, kernelSize=1, stride=1, padding=0)
 
@@ -132,7 +102,6 @@ class SlimBasicBlock(nn.Module):
             paddingOverride=effectivePadding,
             dilationOverride=effectiveDilation,
         )
-        outputs = self.bn1(outputs, activeChannels=outChannels)
         outputs = F.relu(outputs, inplace=True)
 
         outputs = self.conv2(
@@ -142,7 +111,6 @@ class SlimBasicBlock(nn.Module):
             paddingOverride=effectivePadding,
             dilationOverride=effectiveDilation,
         )
-        outputs = self.bn2(outputs, activeChannels=outChannels)
 
         if self.useSE:
             squeeze = F.adaptive_avg_pool2d(outputs, output_size=1)
@@ -155,7 +123,6 @@ class SlimBasicBlock(nn.Module):
 
         if effectiveStride != 1 or inputs.shape[1] != outChannels:
             identity = self.downsampleConv(inputs, outChannels=outChannels, strideOverride=effectiveStride)
-            identity = self.downsampleBn(identity, activeChannels=outChannels)
 
         outputs = outputs + identity
         outputs = F.relu(outputs, inplace=True)
@@ -183,17 +150,12 @@ class SlimStemPath(nn.Module):
         self.pathType = pathType
 
         self.conv7 = SlimConv2d(3, maxStemChannels, kernelSize=7, stride=2, padding=3)
-        self.bn7 = SlimBatchNorm2d(maxStemChannels)
 
         self.conv3a = SlimConv2d(3, maxStemChannels, kernelSize=3, stride=2, padding=1)
-        self.bn3a = SlimBatchNorm2d(maxStemChannels)
         self.conv3b = SlimConv2d(maxStemChannels, maxStemChannels, kernelSize=3, stride=1, padding=1)
-        self.bn3b = SlimBatchNorm2d(maxStemChannels)
 
         self.conv5 = SlimConv2d(3, maxStemChannels, kernelSize=5, stride=2, padding=2)
-        self.bn5 = SlimBatchNorm2d(maxStemChannels)
         self.conv1 = SlimConv2d(maxStemChannels, maxStemChannels, kernelSize=1, stride=1, padding=0)
-        self.bn1 = SlimBatchNorm2d(maxStemChannels)
 
         self.maxPool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.avgPool = nn.AvgPool2d(kernel_size=3, stride=2, padding=1)
@@ -201,27 +163,22 @@ class SlimStemPath(nn.Module):
     def forward(self, inputs: Tensor, stemChannels: int) -> Tensor:
         if self.pathType == 0:
             outputs = self.conv7(inputs, outChannels=stemChannels)
-            outputs = self.bn7(outputs, activeChannels=stemChannels)
             outputs = F.relu(outputs, inplace=True)
             outputs = self.maxPool(outputs)
             return outputs
 
         if self.pathType == 1:
             outputs = self.conv3a(inputs, outChannels=stemChannels)
-            outputs = self.bn3a(outputs, activeChannels=stemChannels)
             outputs = F.relu(outputs, inplace=True)
             outputs = self.conv3b(outputs, outChannels=stemChannels)
-            outputs = self.bn3b(outputs, activeChannels=stemChannels)
             outputs = F.relu(outputs, inplace=True)
             outputs = self.maxPool(outputs)
             return outputs
 
         outputs = self.conv5(inputs, outChannels=stemChannels)
-        outputs = self.bn5(outputs, activeChannels=stemChannels)
         outputs = F.relu(outputs, inplace=True)
         outputs = self.avgPool(outputs)
         outputs = self.conv1(outputs, outChannels=stemChannels)
-        outputs = self.bn1(outputs, activeChannels=stemChannels)
         outputs = F.relu(outputs, inplace=True)
         return outputs
 
@@ -232,13 +189,13 @@ class SlimStemSelector(nn.Module):
         self.stemPathOptions = stemPathOptions
         self.paths = nn.ModuleList([SlimStemPath(maxStemChannels=maxStemChannels, pathType=pathIndex) for pathIndex in stemPathOptions])
 
-    def forward(self, inputs: Tensor, stemChannels: int) -> Tensor:
-        pathOutputs = [path(inputs, stemChannels=stemChannels) for path in self.paths]
-        combinedOutput = torch.zeros_like(pathOutputs[0])
-        equalWeight = 1.0 / len(pathOutputs)
-        for pathOutput in pathOutputs:
-            combinedOutput = combinedOutput + equalWeight * pathOutput
-        return combinedOutput
+    def forward(self, inputs: Tensor, stemChannels: int, stemPathIndex: int) -> Tensor:
+        if stemPathIndex in self.stemPathOptions:
+            selectedPathSlot = self.stemPathOptions.index(stemPathIndex)
+        else:
+            selectedPathSlot = min(max(int(stemPathIndex), 0), len(self.paths) - 1)
+        selectedPath = self.paths[selectedPathSlot]
+        return selectedPath(inputs, stemChannels=stemChannels)
 
 
 class SlimStagePath(nn.Module):
@@ -283,7 +240,6 @@ class SlimStagePath(nn.Module):
         self.blocks = blocks
 
         self.projectionConv = SlimConv2d(maxPathOutChannels, maxCanonicalOutChannels, kernelSize=1, stride=1, padding=0)
-        self.projectionBn = SlimBatchNorm2d(maxCanonicalOutChannels)
 
     def forward(
         self,
@@ -309,7 +265,6 @@ class SlimStagePath(nn.Module):
                 outputs = block(outputs, outChannels=activePathOutChannels, kernelSize=effectiveKernelSize)
 
         outputs = self.projectionConv(outputs, outChannels=activeCanonicalOutChannels)
-        outputs = self.projectionBn(outputs, activeChannels=activeCanonicalOutChannels)
         outputs = F.relu(outputs, inplace=True)
         return outputs
 
@@ -522,7 +477,11 @@ class ResNetSuperNet(nn.Module):
         stageExtraStrides = architectureConfig.stageExtraStrides
         stageFeatures: Dict[int, Tensor] = {}
 
-        outputs = self.stem(inputs, stemChannels=architectureConfig.stemChannels)
+        outputs = self.stem(
+            inputs,
+            stemChannels=architectureConfig.stemChannels,
+            stemPathIndex=architectureConfig.stemPathIndex,
+        )
 
         outputs = self.stage1(
             outputs,

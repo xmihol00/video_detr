@@ -8,5 +8,5 @@ cd "/homes/eva/xm/xmihol00/video_detr/"
 current_time=$(date +"%Y-%m-%d_%H-%M-%S")
 echo "Training started at: $current_time"
 
-python -u cnnSearch/train_supernet.py --enable-complex-paths > train_cnnSearch_$current_time.log 2>&1
+python -u cnnSearch/train_supernet.py > train_cnnSearch_$current_time.log 2>&1
 echo "Training completed"

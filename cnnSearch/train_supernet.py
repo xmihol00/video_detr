@@ -50,11 +50,11 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--valDir", type=str, default=None, help="Optional ImageFolder validation root")
 
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batchSize", type=int, default=72)
+    parser.add_argument("--batchSize", type=int, default=256)
     parser.add_argument("--numWorkers", type=int, default=8)
     parser.add_argument("--imageSize", type=int, default=320)
 
-    parser.add_argument("--learningRate", type=float, default=0.1)
+    parser.add_argument("--learningRate", type=float, default=0.01)
     parser.add_argument("--weightDecay", type=float, default=1e-4)
     parser.add_argument("--momentum", type=float, default=0.9)
 
@@ -78,7 +78,6 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument("--logFormat", type=str, default="text", choices=["text", "json"])
     parser.add_argument("--logFile", type=str, default=None)
     parser.add_argument("--logIntervalSteps", type=int, default=50)
-    parser.add_argument("--bnCalibrationSteps", type=int, default=32, help="Train batches used to recalibrate BatchNorm stats before each validation run; set to 0 to disable")
 
     return parser.parse_args()
 
@@ -285,8 +284,6 @@ def main() -> None:
                 eventLogger=LOGGER,
                 logIntervalSteps=max(1, args.logIntervalSteps * 2),
                 epochIndex=epochIndex,
-                bnCalibrationLoader=dataBundle.trainLoader,
-                bnCalibrationSteps=args.bnCalibrationSteps,
             )
             metricsForLog.update(
                 {

@@ -343,6 +343,25 @@ def attempt_compilation(config_data, experiment_id):
                 "num_samples": int(pipelineResult.evaluation.numSamples),
                 "num_classes": int(pipelineResult.evaluation.numClasses),
             }
+            if pipelineResult.preQuantizationEvaluation is not None:
+                evaluationMetrics["pre_quantization"] = {
+                    "loss": float(pipelineResult.preQuantizationEvaluation.loss),
+                    "top1": float(pipelineResult.preQuantizationEvaluation.top1),
+                    "top5": float(pipelineResult.preQuantizationEvaluation.top5),
+                    "num_samples": int(pipelineResult.preQuantizationEvaluation.numSamples),
+                    "num_classes": int(pipelineResult.preQuantizationEvaluation.numClasses),
+                }
+            if pipelineResult.evaluationDelta is not None:
+                evaluationMetrics["delta"] = dict(pipelineResult.evaluationDelta)
+
+            preTop1 = evaluationMetrics.get("pre_quantization", {}).get("top1")
+            postTop1 = evaluationMetrics.get("top1")
+            top1Drop = evaluationMetrics.get("delta", {}).get("top1_drop")
+            if preTop1 is not None and postTop1 is not None and top1Drop is not None:
+                logEvent(
+                    "INFO",
+                    f"Candidate {experiment_id} accuracy preQ={preTop1:.3f}, postQ={postTop1:.3f}, drop={top1Drop:.3f}",
+                )
 
         logEvent("SUCCESS", f"Compilation succeeded for candidate {experiment_id}")
         return "SUCCESS", None, evaluationMetrics

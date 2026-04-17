@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, cast
-import math
 
 import torch
 from torch import Tensor, nn
@@ -11,7 +10,6 @@ import torch.nn.functional as F
 from cnnSearch.models.supernet import (
     ResNetSuperNet,
     SlimBasicBlock,
-    SlimBatchNorm2d,
     SlimConv2d,
     SlimLinear,
     SlimStemPath,
@@ -27,7 +25,6 @@ from cnnSearch.search_space import (
     decodeStageChannels,
     decodeStagePathChannels,
     resolveStagePathDepth,
-    alignChannels,
 )
 
 
@@ -45,19 +42,13 @@ class BasicBlock(nn.Module):
         padding = (kernelSize // 2) * dilation
         self.useSE = useSE
         self.conv1 = nn.Conv2d(inChannels, outChannels, kernel_size=kernelSize, stride=stride, padding=padding, dilation=dilation, bias=False)
-        self.bn1 = nn.BatchNorm2d(outChannels)
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(outChannels, outChannels, kernel_size=kernelSize, stride=1, padding=padding, dilation=dilation, bias=False)
-        self.bn2 = nn.BatchNorm2d(outChannels)
         self.seReduce = nn.Conv2d(outChannels, max(8, outChannels // 4), kernel_size=1, stride=1, padding=0, bias=False)
         self.seExpand = nn.Conv2d(max(8, outChannels // 4), outChannels, kernel_size=1, stride=1, padding=0, bias=False)
 
-        # Match SlimBasicBlock logic: if stride != 1 or in != out, add downsample
         if stride != 1 or inChannels != outChannels:
-            self.downsample = nn.Sequential(
-                nn.Conv2d(inChannels, outChannels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(outChannels),
-            )
+            self.downsample = nn.Conv2d(inChannels, outChannels, kernel_size=1, stride=stride, bias=False)
         else:
             self.downsample = nn.Identity()
 
@@ -65,11 +56,9 @@ class BasicBlock(nn.Module):
         identity = self.downsample(inputs)
 
         outputs = self.conv1(inputs)
-        outputs = self.bn1(outputs)
         outputs = self.relu(outputs)
 
         outputs = self.conv2(outputs)
-        outputs = self.bn2(outputs)
 
         if self.useSE:
             squeeze = F.adaptive_avg_pool2d(outputs, output_size=1)
@@ -151,7 +140,6 @@ class ResNetSubnet(nn.Module):
         if stemPathIndex == 0:
             return nn.Sequential(
                 nn.Conv2d(3, stemChannels, kernel_size=7, stride=2, padding=3, bias=False),
-                nn.BatchNorm2d(stemChannels),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
             )
@@ -159,21 +147,17 @@ class ResNetSubnet(nn.Module):
         if stemPathIndex == 1:
             return nn.Sequential(
                 nn.Conv2d(3, stemChannels, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(stemChannels),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(stemChannels, stemChannels, kernel_size=3, stride=1, padding=1, bias=False),
-                nn.BatchNorm2d(stemChannels),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
             )
 
         return nn.Sequential(
             nn.Conv2d(3, stemChannels, kernel_size=5, stride=2, padding=2, bias=False),
-            nn.BatchNorm2d(stemChannels),
             nn.ReLU(inplace=True),
             nn.AvgPool2d(kernel_size=3, stride=2, padding=1),
             nn.Conv2d(stemChannels, stemChannels, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(stemChannels),
             nn.ReLU(inplace=True),
         )
 
@@ -212,7 +196,6 @@ class ResNetSubnet(nn.Module):
                 "blocks": nn.Sequential(*blocks),
                 "projection": nn.Sequential(
                     nn.Conv2d(pathOutChannels, canonicalOutChannels, kernel_size=1, stride=1, padding=0, bias=False),
-                    nn.BatchNorm2d(canonicalOutChannels),
                     nn.ReLU(inplace=True),
                 ),
             }
@@ -264,18 +247,6 @@ def _copySlimPointwiseConvWeights(slimConv: SlimConv2d, targetConv: nn.Conv2d, i
         targetConv.weight.copy_(weight)
 
 
-def _copySlimBatchNormWeights(slimBn: SlimBatchNorm2d, targetBn: nn.BatchNorm2d, channels: int) -> None:
-    with torch.no_grad():
-        runningMean = cast(torch.Tensor, slimBn.runningMean)
-        runningVar = cast(torch.Tensor, slimBn.runningVar)
-        targetBn.weight.copy_(slimBn.weight[:channels])
-        targetBn.bias.copy_(slimBn.bias[:channels])
-        if targetBn.running_mean is not None:
-            targetBn.running_mean.copy_(runningMean[:channels])
-        if targetBn.running_var is not None:
-            targetBn.running_var.copy_(runningVar[:channels])
-
-
 def extractSubnetFromSupernet(
     supernetModel: ResNetSuperNet,
     architectureConfig: ArchitectureConfig,
@@ -300,7 +271,6 @@ def extractSubnetFromSupernet(
     superStemPath = cast(SlimStemPath, superStem.paths[selectedStemSlot])
     if selectedStemPath == 0:
         stemConv = cast(nn.Conv2d, subnetModel.stem[0])
-        stemBn = cast(nn.BatchNorm2d, subnetModel.stem[1])
         _copySlimConvWeights(
             superStemPath.conv7,
             stemConv,
@@ -308,12 +278,9 @@ def extractSubnetFromSupernet(
             outChannels=architectureConfig.stemChannels,
             kernelSize=7,
         )
-        _copySlimBatchNormWeights(superStemPath.bn7, stemBn, channels=architectureConfig.stemChannels)
     elif selectedStemPath == 1:
         stemConvA = cast(nn.Conv2d, subnetModel.stem[0])
-        stemBnA = cast(nn.BatchNorm2d, subnetModel.stem[1])
-        stemConvB = cast(nn.Conv2d, subnetModel.stem[3])
-        stemBnB = cast(nn.BatchNorm2d, subnetModel.stem[4])
+        stemConvB = cast(nn.Conv2d, subnetModel.stem[2])
         _copySlimConvWeights(
             superStemPath.conv3a,
             stemConvA,
@@ -321,7 +288,6 @@ def extractSubnetFromSupernet(
             outChannels=architectureConfig.stemChannels,
             kernelSize=3,
         )
-        _copySlimBatchNormWeights(superStemPath.bn3a, stemBnA, channels=architectureConfig.stemChannels)
         _copySlimConvWeights(
             superStemPath.conv3b,
             stemConvB,
@@ -329,12 +295,9 @@ def extractSubnetFromSupernet(
             outChannels=architectureConfig.stemChannels,
             kernelSize=3,
         )
-        _copySlimBatchNormWeights(superStemPath.bn3b, stemBnB, channels=architectureConfig.stemChannels)
     else:
         stemConv5 = cast(nn.Conv2d, subnetModel.stem[0])
-        stemBn5 = cast(nn.BatchNorm2d, subnetModel.stem[1])
-        stemConv1 = cast(nn.Conv2d, subnetModel.stem[4])
-        stemBn1 = cast(nn.BatchNorm2d, subnetModel.stem[5])
+        stemConv1 = cast(nn.Conv2d, subnetModel.stem[3])
         _copySlimConvWeights(
             superStemPath.conv5,
             stemConv5,
@@ -342,14 +305,12 @@ def extractSubnetFromSupernet(
             outChannels=architectureConfig.stemChannels,
             kernelSize=5,
         )
-        _copySlimBatchNormWeights(superStemPath.bn5, stemBn5, channels=architectureConfig.stemChannels)
         _copySlimPointwiseConvWeights(
             superStemPath.conv1,
             stemConv1,
             inChannels=architectureConfig.stemChannels,
             outChannels=architectureConfig.stemChannels,
         )
-        _copySlimBatchNormWeights(superStemPath.bn1, stemBn1, channels=architectureConfig.stemChannels)
 
     superStages = [supernetModel.stage1, supernetModel.stage2, supernetModel.stage3, supernetModel.stage4]
     subStages = [subnetModel.stage1, subnetModel.stage2, subnetModel.stage3, subnetModel.stage4]
@@ -382,7 +343,6 @@ def extractSubnetFromSupernet(
                 outChannels=stagePathOutChannels,
                 kernelSize=stageKernelSize,
             )
-            _copySlimBatchNormWeights(superBlock.bn1, subBlock.bn1, channels=stagePathOutChannels)
 
             _copySlimConvWeights(
                 superBlock.conv2,
@@ -391,19 +351,15 @@ def extractSubnetFromSupernet(
                 outChannels=stagePathOutChannels,
                 kernelSize=stageKernelSize,
             )
-            _copySlimBatchNormWeights(superBlock.bn2, subBlock.bn2, channels=stagePathOutChannels)
 
-            if isinstance(subBlock.downsample, nn.Sequential):
-                downsampleConv = cast(nn.Conv2d, subBlock.downsample[0])
-                downsampleBn = cast(nn.BatchNorm2d, subBlock.downsample[1])
+            if isinstance(subBlock.downsample, nn.Conv2d):
                 _copySlimConvWeights(
                     superBlock.downsampleConv,
-                    downsampleConv,
+                    subBlock.downsample,
                     inChannels=blockInChannels,
                     outChannels=stagePathOutChannels,
                     kernelSize=1,
                 )
-                _copySlimBatchNormWeights(superBlock.downsampleBn, downsampleBn, channels=stagePathOutChannels)
 
             if subBlock.useSE:
                 seHiddenChannels = max(8, stagePathOutChannels // 4)
@@ -421,7 +377,6 @@ def extractSubnetFromSupernet(
                 )
 
         projectionConv = cast(nn.Conv2d, subProjection[0])
-        projectionBn = cast(nn.BatchNorm2d, subProjection[1])
         _copySlimConvWeights(
             selectedSuperPath.projectionConv,
             projectionConv,
@@ -429,7 +384,6 @@ def extractSubnetFromSupernet(
             outChannels=stageCanonicalChannels,
             kernelSize=1,
         )
-        _copySlimBatchNormWeights(selectedSuperPath.projectionBn, projectionBn, channels=stageCanonicalChannels)
 
     with torch.no_grad():
         classifierHead = cast(SlimLinear, supernetModel.classifier)

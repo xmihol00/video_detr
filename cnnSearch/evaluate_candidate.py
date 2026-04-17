@@ -16,10 +16,13 @@ import torch.nn.functional as F
 from cnnSearch.architecture_io import loadArchitectureConfig
 from cnnSearch.data import buildImageFolderLoaders
 from cnnSearch.logging_utils import LoggingConfig, configureLogging, getEventLogger
+from cnnSearch.model_pipeline import (
+    buildSearchSpaceForCheckpoint,
+    loadSupernetFromCheckpoint,
+)
 from cnnSearch.models.subnet import extractSubnetFromSupernet
-from cnnSearch.models.supernet import ResNetSuperNet
 from cnnSearch.profiling import collectModelResourceMetrics
-from cnnSearch.search_space import DEFAULT_SEARCH_SPACE
+from cnnSearch.search_space import normalizeArchitectureForSearchSpace
 
 
 LOGGER = getEventLogger(__name__)
@@ -125,42 +128,18 @@ def main() -> None:
         eventLogger=LOGGER,
     )
 
-    searchSpace = type(DEFAULT_SEARCH_SPACE)(
-        inputResolutions=DEFAULT_SEARCH_SPACE.inputResolutions,
-        outputStrides=DEFAULT_SEARCH_SPACE.outputStrides,
-        depthOptionsPerStage=DEFAULT_SEARCH_SPACE.depthOptionsPerStage,
-        widthMultipliersPerStage=DEFAULT_SEARCH_SPACE.widthMultipliersPerStage,
-        baseChannelsPerStage=DEFAULT_SEARCH_SPACE.baseChannelsPerStage,
-        stemChannels=DEFAULT_SEARCH_SPACE.stemChannels,
-        stemPathOptions=DEFAULT_SEARCH_SPACE.stemPathOptions,
-        stagePathOptionsPerStage=DEFAULT_SEARCH_SPACE.stagePathOptionsPerStage,
-        stageKernelSizeOptionsPerStage=DEFAULT_SEARCH_SPACE.stageKernelSizeOptionsPerStage,
-        stageExtraStrideOptionsPerStage=DEFAULT_SEARCH_SPACE.stageExtraStrideOptionsPerStage,
-        pathDepthMultipliers=DEFAULT_SEARCH_SPACE.pathDepthMultipliers,
-        pathWidthMultipliers=DEFAULT_SEARCH_SPACE.pathWidthMultipliers,
-        pathDilations=DEFAULT_SEARCH_SPACE.pathDilations,
-        pathUseSE=DEFAULT_SEARCH_SPACE.pathUseSE,
-        pathMinKernelSizes=DEFAULT_SEARCH_SPACE.pathMinKernelSizes,
-        pathNames=DEFAULT_SEARCH_SPACE.pathNames,
-        auxiliaryHeadStages=DEFAULT_SEARCH_SPACE.auxiliaryHeadStages,
-        numClasses=valBundle.numClasses,
+    useComplexPaths = any(int(pathIndex) > 2 for pathIndex in architectureConfig.stagePathIndices)
+    searchSpace = buildSearchSpaceForCheckpoint(args.supernetCheckpoint, useComplexPaths=useComplexPaths)
+    supernet = loadSupernetFromCheckpoint(args.supernetCheckpoint, searchSpace=searchSpace)
+    LOGGER.info("Supernet checkpoint loaded", useComplexPaths=useComplexPaths, numClasses=searchSpace.numClasses)
+
+    normalizedArchitectureConfig = normalizeArchitectureForSearchSpace(
+        architectureConfig,
+        searchSpace=searchSpace,
+        enableAuxiliaryHeads=False,
     )
 
-    supernet = ResNetSuperNet(searchSpace=searchSpace)
-    LOGGER.info("Loading supernet checkpoint")
-    checkpoint = torch.load(args.supernetCheckpoint, map_location="cpu")
-    if "model" in checkpoint:
-        modelState = checkpoint["model"]
-    else:
-        modelState = checkpoint
-
-    if any(key.startswith("module.") for key in modelState.keys()):
-        modelState = {key.replace("module.", "", 1): value for key, value in modelState.items()}
-
-    supernet.load_state_dict(modelState)
-    LOGGER.info("Supernet checkpoint loaded", stateKeys=len(modelState))
-
-    extracted = extractSubnetFromSupernet(supernet, architectureConfig=architectureConfig, searchSpace=searchSpace)
+    extracted = extractSubnetFromSupernet(supernet, architectureConfig=normalizedArchitectureConfig, searchSpace=searchSpace)
     subnet = extracted.model.to(device)
 
     accuracyMetrics = evaluateTopK(
@@ -172,7 +151,7 @@ def main() -> None:
 
     resourceMetrics = collectModelResourceMetrics(
         model=subnet,
-        inputResolution=architectureConfig.inputResolution,
+        inputResolution=normalizedArchitectureConfig.inputResolution,
         device=device,
     )
     LOGGER.info(
@@ -182,7 +161,7 @@ def main() -> None:
     )
 
     result = {
-        "architecture": architectureConfig.toDict(),
+        "architecture": normalizedArchitectureConfig.toDict(),
         "accuracy": accuracyMetrics,
         "resources": resourceMetrics,
     }

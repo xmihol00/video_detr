@@ -60,6 +60,8 @@ class CandidatePipelineResult:
     quantizedOnnxPath: str
     compilation: CompilationResult
     evaluation: Optional[EvaluationResult]
+    preQuantizationEvaluation: Optional[EvaluationResult]
+    evaluationDelta: Optional[Dict[str, float]]
 
 
 def selectOnnxExecutionProviders(
@@ -104,27 +106,17 @@ def _logPipeline(message: str) -> None:
     print(f"[pipeline {timestamp}] {message}")
 
 
-def withSearchSpaceNumClasses(searchSpace: SearchSpaceConfig, numClasses: int) -> SearchSpaceConfig:
-    return SearchSpaceConfig(
-        inputResolutions=list(searchSpace.inputResolutions),
-        outputStrides=list(searchSpace.outputStrides),
-        depthOptionsPerStage=[list(options) for options in searchSpace.depthOptionsPerStage],
-        widthMultipliersPerStage=[list(options) for options in searchSpace.widthMultipliersPerStage],
-        baseChannelsPerStage=list(searchSpace.baseChannelsPerStage),
-        stemChannels=list(searchSpace.stemChannels),
-        stemPathOptions=list(searchSpace.stemPathOptions),
-        stagePathOptionsPerStage=[list(options) for options in searchSpace.stagePathOptionsPerStage],
-        stageKernelSizeOptionsPerStage=[list(options) for options in searchSpace.stageKernelSizeOptionsPerStage],
-        stageExtraStrideOptionsPerStage=[list(options) for options in searchSpace.stageExtraStrideOptionsPerStage],
-        pathDepthMultipliers=list(searchSpace.pathDepthMultipliers),
-        pathWidthMultipliers=list(searchSpace.pathWidthMultipliers),
-        pathDilations=list(searchSpace.pathDilations),
-        pathUseSE=list(searchSpace.pathUseSE),
-        pathMinKernelSizes=list(searchSpace.pathMinKernelSizes),
-        pathNames=list(searchSpace.pathNames),
-        auxiliaryHeadStages=list(searchSpace.auxiliaryHeadStages),
-        numClasses=int(numClasses),
-    )
+def _buildEvaluationDelta(
+    preQuantizationEvaluation: Optional[EvaluationResult],
+    quantizedEvaluation: Optional[EvaluationResult],
+) -> Optional[Dict[str, float]]:
+    if preQuantizationEvaluation is None or quantizedEvaluation is None:
+        return None
+    return {
+        "top1_drop": float(preQuantizationEvaluation.top1 - quantizedEvaluation.top1),
+        "top5_drop": float(preQuantizationEvaluation.top5 - quantizedEvaluation.top5),
+        "loss_delta": float(quantizedEvaluation.loss - preQuantizationEvaluation.loss),
+    }
 
 
 def loadModelStateDictFromCheckpoint(checkpointPath: str) -> Dict[str, Any]:
@@ -205,7 +197,7 @@ def loadSupernetFromCheckpoint(
 ) -> ResNetSuperNet:
     supernetModel = ResNetSuperNet(searchSpace=searchSpace)
     modelStateDict = loadModelStateDictFromCheckpoint(checkpointPath)
-    supernetModel.load_state_dict(modelStateDict)
+    supernetModel.load_state_dict(modelStateDict, strict=False)
     supernetModel.eval()
     return supernetModel
 
@@ -390,6 +382,119 @@ class OnnxClassificationEvaluator:
         return result
 
 
+class PytorchClassificationEvaluator:
+    """Evaluate a PyTorch classification model on an ImageFolder dataset."""
+
+    def __init__(
+        self,
+        datasetPath: str,
+        imageSize: int,
+        batchSize: int = 32,
+        numWorkers: int = 4,
+        maxImages: Optional[int] = None,
+        logEveryBatches: int = 20,
+        progressPrefix: str = "",
+        enableProgressLogging: bool = True,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        self.datasetPath = datasetPath
+        self.imageSize = int(imageSize)
+        self.batchSize = int(batchSize)
+        self.numWorkers = int(numWorkers)
+        self.maxImages = int(maxImages) if maxImages is not None and int(maxImages) > 0 else None
+        self.logEveryBatches = max(1, int(logEveryBatches))
+        self.progressPrefix = progressPrefix.strip()
+        self.enableProgressLogging = bool(enableProgressLogging)
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
+
+    def _progressTag(self) -> str:
+        return f"[{self.progressPrefix}] " if self.progressPrefix != "" else ""
+
+    def _buildDataLoader(self) -> tuple[DataLoader, int, int]:
+        fullDataset = ImageFolder(self.datasetPath, transform=buildEvalTransform(self.imageSize))
+        numClasses = len(fullDataset.classes)
+        evalDataset = fullDataset
+        if self.maxImages is not None and self.maxImages < len(evalDataset):
+            evalDataset = Subset(evalDataset, list(range(self.maxImages)))
+
+        dataLoader = DataLoader(
+            evalDataset,
+            batch_size=self.batchSize,
+            shuffle=False,
+            num_workers=self.numWorkers,
+            pin_memory=self.device.type == "cuda",
+            drop_last=False,
+            persistent_workers=self.numWorkers > 0,
+        )
+        return dataLoader, numClasses, len(evalDataset)
+
+    def evaluateModel(self, model: torch.nn.Module) -> EvaluationResult:
+        import time
+
+        model = model.to(self.device)
+        model.eval()
+        dataLoader, numClasses, totalImages = self._buildDataLoader()
+        totalBatches = len(dataLoader)
+
+        if self.enableProgressLogging:
+            _logPipeline(
+                f"{self._progressTag()}Float evaluation start: {totalImages} images, "
+                f"{totalBatches} batches, batchSize={self.batchSize}, device={self.device}"
+            )
+
+        totalLoss = 0.0
+        totalTop1Correct = 0
+        totalTop5Correct = 0
+        totalSamples = 0
+        wallStart = time.time()
+
+        with torch.no_grad():
+            for batchIndex, (images, labels) in enumerate(dataLoader, start=1):
+                images = images.to(self.device, non_blocking=self.device.type == "cuda")
+                labels = labels.to(self.device, non_blocking=self.device.type == "cuda")
+
+                logitsTensor = model(images)
+
+                batchLoss = F.cross_entropy(logitsTensor, labels, reduction="sum")
+                totalLoss += float(batchLoss.item())
+
+                top1Pred = logitsTensor.argmax(dim=1)
+                totalTop1Correct += int((top1Pred == labels).sum().item())
+
+                topK = min(5, logitsTensor.shape[1])
+                topKPred = logitsTensor.topk(topK, dim=1).indices
+                top5Matches = topKPred.eq(labels.view(-1, 1)).any(dim=1)
+                totalTop5Correct += int(top5Matches.sum().item())
+                totalSamples += int(labels.shape[0])
+
+                if self.enableProgressLogging and (batchIndex % self.logEveryBatches == 0 or batchIndex == totalBatches):
+                    elapsed = max(1e-6, time.time() - wallStart)
+                    imagesPerSecond = float(totalSamples) / elapsed
+                    _logPipeline(
+                        f"{self._progressTag()}Float evaluation progress: batch {batchIndex}/{totalBatches}, "
+                        f"processed={totalSamples}/{totalImages} images, throughput={imagesPerSecond:.2f} img/s"
+                    )
+
+        safeDenominator = max(1, totalSamples)
+        result = EvaluationResult(
+            loss=float(totalLoss / safeDenominator),
+            top1=float(100.0 * totalTop1Correct / safeDenominator),
+            top5=float(100.0 * totalTop5Correct / safeDenominator),
+            numSamples=int(totalSamples),
+            numClasses=int(numClasses),
+        )
+        if self.enableProgressLogging:
+            elapsed = max(1e-6, time.time() - wallStart)
+            _logPipeline(
+                f"{self._progressTag()}Float evaluation done: top1={result.top1:.3f}, "
+                f"top5={result.top5:.3f}, loss={result.loss:.5f}, elapsed={elapsed:.2f}s"
+            )
+        return result
+
+
 class SubnetCompilationPipeline:
     """Shared subnet quantize/compile/evaluate pipeline used by search and standalone CLI."""
 
@@ -535,14 +640,55 @@ class SubnetCompilationPipeline:
 
         quantizationResult: Optional[QuantizationResult] = None
         compilationResult: Optional[CompilationResult] = None
+        preQuantizationEvaluation: Optional[EvaluationResult] = None
         evaluationResult: Optional[EvaluationResult] = None
         try:
+            normalizedConfig = normalizeArchitectureForSearchSpace(
+                architectureConfig,
+                searchSpace=self.searchSpace,
+                enableAuxiliaryHeads=False,
+            )
+            extractedSubnet = extractSubnetFromSupernet(
+                supernetModel,
+                normalizedConfig,
+                searchSpace=self.searchSpace,
+            )
+            subnetModel = extractedSubnet.model.to(device="cpu").eval()
+            paramCount = self._countParameters(subnetModel)
+
+            if evaluationDatasetPath is not None and evaluationDatasetPath.strip() != "":
+                floatEvaluator = PytorchClassificationEvaluator(
+                    datasetPath=evaluationDatasetPath,
+                    imageSize=normalizedConfig.inputResolution,
+                    batchSize=evaluationBatchSize,
+                    numWorkers=evaluationNumWorkers,
+                    maxImages=evaluationMaxImages,
+                    logEveryBatches=evaluationLogEveryBatches,
+                    progressPrefix=experimentLabel,
+                    enableProgressLogging=enableProgressLogging,
+                )
+                preQuantizationEvaluation = floatEvaluator.evaluateModel(subnetModel)
+
             if enableProgressLogging:
                 _logPipeline(f"[{experimentLabel}] Quantization started")
-            quantizationResult = self.quantizeSubnet(
-                supernetModel=supernetModel,
-                architectureConfig=architectureConfig,
+            representativeDataGenerator = RepresentativeDataGenerator(
+                self.calibrationImagesDir,
+                input_shape=(3, normalizedConfig.inputResolution, normalizedConfig.inputResolution),
+                batch_size=1,
+                num_images=1,
+                device="cpu",
+            )
+            exporter = Imx500Exporter(device=self.exporterDevice)
+            _runQuantizationCpuOnly(
+                exporter=exporter,
+                model=subnetModel,
+                representativeDataGenerator=representativeDataGenerator,
                 outputOnnxPath=onnxPath,
+            )
+            quantizationResult = QuantizationResult(
+                architectureConfig=normalizedConfig,
+                paramCount=paramCount,
+                onnxPath=onnxPath,
             )
             if enableProgressLogging:
                 _logPipeline(
@@ -588,12 +734,25 @@ class SubnetCompilationPipeline:
                 )
                 evaluationResult = evaluator.evaluateModel(quantizationResult.onnxPath)
 
+            evaluationDelta = _buildEvaluationDelta(preQuantizationEvaluation, evaluationResult)
+            if enableProgressLogging and evaluationDelta is not None:
+                assert preQuantizationEvaluation is not None
+                assert evaluationResult is not None
+                _logPipeline(
+                    f"[{experimentLabel}] Accuracy summary: "
+                    f"preQ_top1={preQuantizationEvaluation.top1:.3f}, "
+                    f"postQ_top1={evaluationResult.top1:.3f}, "
+                    f"top1_drop={evaluationDelta['top1_drop']:.3f}"
+                )
+
             return CandidatePipelineResult(
                 architectureConfig=quantizationResult.architectureConfig,
                 paramCount=quantizationResult.paramCount,
                 quantizedOnnxPath=quantizationResult.onnxPath,
                 compilation=compilationResult,
                 evaluation=evaluationResult,
+                preQuantizationEvaluation=preQuantizationEvaluation,
+                evaluationDelta=evaluationDelta,
             )
         finally:
             if not keepArtifacts:

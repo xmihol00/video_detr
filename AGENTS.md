@@ -90,6 +90,7 @@ vidDetr
 Implement unit tests using `pytest`. Tests should be organized by module and functionality. Use mocks to simulate hardware interactions and TCP communication. The testing does not have to be exhaustive, since the code will have to be tested on physical hardware eventually, but it should cover critical logic paths and edge cases.
 - All tests live under `tests/`.
 - Tests should not on training data, use some dummy values.
+- Do not write tests for demanding tasks like network compilation, evaluation, etc. This has to be tested by a human on a GPU server.
 
 ## Notes for AI Agents
 - Write TODO lists to avoid forgetting important steps in the implementation.

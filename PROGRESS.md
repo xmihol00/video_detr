@@ -1,5 +1,19 @@
 # PROGRESS
 
+## 2026-04-02
+
+- Removed BatchNorm across `cnnSearch` supernet/subnet architecture for simpler subnet sampling and evaluation:
+  - deleted `SlimBatchNorm2d` and all BN usage in `cnnSearch/models/supernet.py`,
+  - removed all `nn.BatchNorm2d` layers and BN copy logic in `cnnSearch/models/subnet.py`.
+- Kept architecture sampling semantics aligned:
+  - supernet stem now uses architecture-selected path directly (`stemPathIndex`) instead of any path fusion behavior.
+- Removed BN calibration infrastructure from training/evaluation stack:
+  - deleted BN recalibration helpers from `cnnSearch/trainer.py` and `cnnSearch/model_pipeline.py`,
+  - removed BN calibration CLI options and call-sites from `cnnSearch/train_supernet.py`, `cnnSearch/evaluation.py`, `cnnSearch/engine.py`, and `cnnSearch/evaluate_candidate.py`.
+- Improved transition compatibility for legacy checkpoints:
+  - `loadSupernetFromCheckpoint(...)` now loads with `strict=False` in `cnnSearch/model_pipeline.py` to tolerate removed BN parameters.
+- Updated `ANALYSIS_REPORT.md` with BN-free final-state architecture rationale and implementation summary.
+
 ## 2026-03-31
 
 - Added a reusable quantize/compile/evaluate pipeline in `cnnSearch/model_pipeline.py`:
