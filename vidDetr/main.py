@@ -155,13 +155,13 @@ def getArgsParser():
                         help='Gradient clipping max norm; per-epoch schedule')
     
     # Warmup parameters
-    parser.add_argument('--warmupEpochs', default=0, type=int,
+    parser.add_argument('--warmupEpochs', default=2, type=int,
                         help='Number of warmup epochs with linearly increasing LR')
     parser.add_argument('--warmupStartLr', default=1e-6, type=float,
                         help='Starting learning rate for warmup')
     
     # Gradient accumulation
-    parser.add_argument('--accumSteps', default=1, type=int,
+    parser.add_argument('--accumSteps', default=2, type=int,
                         help='Gradient accumulation steps (effective batch = batchSize * accumSteps)')
     
     # Model parameters
@@ -171,10 +171,10 @@ def getArgsParser():
                         help='Freeze backbone parameters during training')
     parser.add_argument('--dilation', action='store_true', default=False,
                         help='Use dilation in last backbone block')
-    parser.add_argument('--positionEmbedding', default='sine', type=str,
+    parser.add_argument('--positionEmbedding', default='learned', type=str,
                         choices=['sine', 'learned'],
                         help='Type of spatial positional embedding')
-    parser.add_argument('--temporalEncoding', default='sine', type=str,
+    parser.add_argument('--temporalEncoding', default='learned', type=str,
                         choices=['sine', 'learned'],
                         help='Type of temporal positional embedding')
     
@@ -187,7 +187,7 @@ def getArgsParser():
                         help='Feedforward dimension in transformer')
     parser.add_argument('--hiddenDim', default=256, type=int,
                         help='Transformer hidden dimension')
-    parser.add_argument('--dropout', default=[0.15, 0.15, 0.15], nargs='+', type=float,
+    parser.add_argument('--dropout', default=[0.1], nargs='+', type=float,
                         help='Dropout rate in transformer and heads; per-epoch schedule')
     parser.add_argument('--nheads', default=8, type=int,
                         help='Number of attention heads')
@@ -197,11 +197,11 @@ def getArgsParser():
     # VideoDETR specific parameters
     parser.add_argument('--numFrames', default=4, type=int,
                         help='Number of frames per video clip')
-    parser.add_argument('--queriesPerFrame', default=30, type=int,
+    parser.add_argument('--queriesPerFrame', default=50, type=int,
                         help='Number of detection queries per frame')
-    parser.add_argument('--trackingEmbedDim', default=128, type=int,
+    parser.add_argument('--trackingEmbedDim', default=256, type=int,
                         help='Dimension of tracking embeddings')
-    parser.add_argument('--numTrackingDecLayers', default=1, type=int,
+    parser.add_argument('--numTrackingDecLayers', default=0, type=int,
                         help='Number of decoder layers dedicated to the tracking path. '
                              'The last N decoder layers are split into two separate paths: '
                              'one for detection (class + box) and one for tracking (contrastive). '
@@ -232,7 +232,7 @@ def getArgsParser():
                         help='L1 box loss coefficient; per-epoch schedule')
     parser.add_argument('--giouLossCoef', default=[2.0], nargs='+', type=float,
                         help='GIoU loss coefficient; per-epoch schedule')
-    parser.add_argument('--eosCoef', default=[0.1, 0.11, 0.125, 0.15, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.3], nargs='+', type=float,
+    parser.add_argument('--eosCoef', default=[0.02, 0.04, 0.06, 0.07, 0.08, 0.09, 0.10], nargs='+', type=float,
                         help='No-object class weight (higher = fewer false positives); per-epoch schedule')
     parser.add_argument('--trackingLossCoef', default=[1.0], nargs='+', type=float,
                         help='Tracking contrastive loss coefficient; per-epoch schedule')
@@ -254,11 +254,11 @@ def getArgsParser():
                         help='Coefficient for denoising losses (multiplied with base loss coefs); per-epoch schedule')
     
     # Duplicate suppression loss
-    parser.add_argument('--dupLossCoef', default=[0.0, 0.1, 0.25], nargs='+', type=float,
+    parser.add_argument('--dupLossCoef', default=[0.0], nargs='+', type=float,
                         help='Weight for IoU-based duplicate suppression loss; per-epoch schedule')
     
     # EMA (Exponential Moving Average)
-    parser.add_argument('--useEma', action='store_true', default=False,
+    parser.add_argument('--useEma', action='store_true', default=True,
                         help='Use EMA (exponential moving average) of model weights')
     parser.add_argument('--noEma', dest='useEma', action='store_false',
                         help='Disable EMA')
@@ -266,7 +266,7 @@ def getArgsParser():
                         help='EMA decay rate')
     
     # Drop path (stochastic depth)
-    parser.add_argument('--dropPathRate', default=[0.025, 0.033, 0.05, 0.066, 0.075, 0.1], nargs='+', type=float,
+    parser.add_argument('--dropPathRate', default=[0.0], nargs='+', type=float,
                         help='Drop path rate for stochastic depth regularization; per-epoch schedule')
     
     # Dataset parameters
@@ -278,7 +278,7 @@ def getArgsParser():
                         help='Total frames in each video sequence')
     parser.add_argument('--minFrameGap', default=1, type=int,
                         help='Minimum gap between sampled frames')
-    parser.add_argument('--maxFrameGap', default=10, type=int,
+    parser.add_argument('--maxFrameGap', default=1, type=int,
                         help='Maximum gap between sampled frames')
     parser.add_argument('--maxSize', default=640, type=int,
                         help='Maximum image size after transforms')
@@ -296,7 +296,8 @@ def getArgsParser():
                         help='Overlap fraction between TAO video windows (0-1)')
     
     # Video dataset parameters (single long-sequence format)
-    parser.add_argument('--videoDataRoot', default="/mnt/matylda5/xmihol00/datasets/climbing_videos", type=str,
+    parser.add_argument('--videoDataRoot', default=None, #"/mnt/matylda5/xmihol00/datasets/climbing_videos", 
+                        type=str,
                         help='Root directory of video dataset containing train/ and val/ '
                              'subdirs (each with images/ and labels/). '
                              'Overrides --dataConfig and --taoDataRoot.')
@@ -336,7 +337,7 @@ def getArgsParser():
                         help='Number of dataloader workers')
     
     # Debug visualisation
-    parser.add_argument('--debugFrames', action='store_true', default=True,
+    parser.add_argument('--debugFrames', action='store_true', default=False,
                         help='Save one debug frame per batch to debug_frames/ '
                              '(GT green dashed, predictions red solid)')
     
@@ -347,10 +348,12 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-03-03/video_detr_best.pth', type=str,
-                        help='Path to pretrained DETR weights')
+    #parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-03-03/video_detr_best.pth', type=str,
+    #                    help='Path to pretrained DETR weights')
     #parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
     #                help='Path to pretrained DETR weights')
+    parser.add_argument('--pretrainedDetr', default="", type=str,
+                    help='Path to pretrained DETR weights')
     
     # Freeze pretrained weights
     parser.add_argument('--freezePretrained', action='store_true', default=False,

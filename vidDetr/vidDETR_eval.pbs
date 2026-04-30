@@ -1,0 +1,19 @@
+#!/bin/bash
+
+cd "/homes/eva/xm/xmihol00"
+source setup.sh
+conda activate orig_yolo
+cd "/homes/eva/xm/xmihol00/video_detr/"
+
+current_time=$(date +"%Y-%m-%d_%H-%M-%S")
+echo "Training started at: $current_time"
+
+python -u vidDetr/viddetr_evaluation.py \
+    --model /homes/eva/xm/xmihol00/video_detr/weights_2026-02-26/video_detr_best.pth \
+    --data-config vidDetr/data.yaml \
+    --split val \
+    --conf 0.35 \
+    --tracking-threshold 0.4 \
+    --output-dir runs/viddetr_eval
+
+echo "Training completed"
