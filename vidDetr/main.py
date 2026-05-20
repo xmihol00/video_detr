@@ -143,7 +143,7 @@ def getArgsParser():
                         help='Base learning rate')
     parser.add_argument('--lrBackbone', default=1e-5, type=float,
                         help='Learning rate for backbone')
-    parser.add_argument('--batchSize', default=20, type=int,
+    parser.add_argument('--batchSize', default=15, type=int,
                         help='Batch size per GPU')
     parser.add_argument('--weightDecay', default=1e-4, type=float,
                         help='Weight decay')
@@ -234,7 +234,7 @@ def getArgsParser():
                         help='GIoU loss coefficient; per-epoch schedule')
     parser.add_argument('--eosCoef', default=[0.02, 0.04, 0.06, 0.07, 0.08, 0.09, 0.10], nargs='+', type=float,
                         help='No-object class weight (higher = fewer false positives); per-epoch schedule')
-    parser.add_argument('--trackingLossCoef', default=[1.0], nargs='+', type=float,
+    parser.add_argument('--trackingLossCoef', default=[2.0], nargs='+', type=float,
                         help='Tracking contrastive loss coefficient; per-epoch schedule')
     parser.add_argument('--contrastiveTemp', default=[0.07], nargs='+', type=float,
                         help='Temperature for contrastive loss; per-epoch schedule')
@@ -348,12 +348,12 @@ def getArgsParser():
                         help='URL for distributed training setup')
     
     # Pretrained weights
-    #parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-03-03/video_detr_best.pth', type=str,
-    #                    help='Path to pretrained DETR weights')
+    parser.add_argument('--pretrainedDetr', default='/homes/eva/xm/xmihol00/video_detr/weights_2026-03-03/video_detr_best.pth', type=str,
+                        help='Path to pretrained DETR weights')
     #parser.add_argument('--pretrainedDetr', default='/mnt/matylda5/xmihol00/video_detr/detr-r50-e632da11.pth', type=str,
     #                help='Path to pretrained DETR weights')
-    parser.add_argument('--pretrainedDetr', default="", type=str,
-                    help='Path to pretrained DETR weights')
+    #parser.add_argument('--pretrainedDetr', default="", type=str,
+    #                help='Path to pretrained DETR weights')
     
     # Freeze pretrained weights
     parser.add_argument('--freezePretrained', action='store_true', default=False,
